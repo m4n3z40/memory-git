@@ -1,0 +1,8 @@
+output-repo
+node_modules
+.pnpm-store
+coverage
+dist
+*.tgz
+.npm
+.DS_Store

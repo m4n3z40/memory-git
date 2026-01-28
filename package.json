@@ -1,0 +1,66 @@
+{
+  "name": "memory-git",
+  "version": "1.0.0",
+  "description": "In-memory Git implementation with disk flush support. All git operations run in memory, minimizing IO, and sync to disk only when needed.",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "example": "node example.js",
+    "benchmark": "node benchmark.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "prepublishOnly": "npm run clean && npm run build && npm test"
+  },
+  "keywords": [
+    "git",
+    "memory",
+    "in-memory",
+    "isomorphic-git",
+    "memfs",
+    "vfs",
+    "virtual-filesystem",
+    "git-in-memory",
+    "flush",
+    "non-blocking",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/m4n3z40/memory-git.git"
+  },
+  "bugs": {
+    "url": "https://github.com/m4n3z40/memory-git/issues"
+  },
+  "homepage": "https://github.com/m4n3z40/memory-git#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "packageManager": "pnpm@10.25.0",
+  "dependencies": {
+    "isomorphic-git": "^1.36.3",
+    "memfs": "^4.56.10"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "4.0.18",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.18"
+  }
+}
