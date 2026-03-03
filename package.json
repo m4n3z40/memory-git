@@ -1,6 +1,6 @@
 {
   "name": "memory-git",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "description": "In-memory Git implementation with disk flush support. All git operations run in memory, minimizing IO, and sync to disk only when needed.",
   "main": "dist/index.js",
   "exports": {
