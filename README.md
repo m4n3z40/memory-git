@@ -1,17 +1,15 @@
 # MemoryGit
 
-In-memory Git implementation that minimizes IO operations. The project is loaded into memory, all git operations are executed in memory, and only at the end are changes synchronized (flushed) to disk.
+In-memory Git implementation for test environments. All git operations run in memory — no process spawns, no disk IO — and sync to disk only when you explicitly call `flush()`.
 
 ## Features
 
-- **Zero IO during git operations**: All operations are done in memory
-- **Non-blocking**: All real disk operations use `fs.promises` (async) to not block the event loop
-- **Operation logging**: Records all operations performed with timestamps
-- **Controlled flush**: Syncs to disk only when you decide
-- **Complete API**: Supports main git operations (init, add, commit, branch, merge, etc.)
-- **In-memory stash**: Stash support without touching disk
-- **Usage metrics**: Operation statistics and memory usage
-- **Parallel copying**: Files are copied in parallel during `loadFromDisk` and `flush` for better performance
+- **Zero IO during git operations** — all operations are done in memory
+- **Isolated volumes** — each instance has its own independent filesystem, safe for parallel tests
+- **Non-blocking** — real disk operations use `fs.promises` to avoid blocking the event loop
+- **Controlled flush** — syncs to disk only when you decide
+- **Operation logging** — records all operations with timestamps and stats
+- **Complete API** — init, add, commit, branch, merge, tags, reset, stash, and more
 
 ## Installation
 
@@ -19,103 +17,97 @@ In-memory Git implementation that minimizes IO operations. The project is loaded
 npm install memory-git
 # or
 pnpm add memory-git
-# or
-yarn add memory-git
 ```
 
 ## Basic Usage
 
-```javascript
-const { MemoryGit } = require('memory-git');
+```typescript
+import { MemoryGit } from 'memory-git';
 
-async function example() {
-    const memGit = new MemoryGit('my-project');
-    
-    // Set the author
-    memGit.setAuthor('Your Name', 'email@example.com');
-    
-    // Initialize a new repository in memory
-    await memGit.init();
-    
-    // Create files (in memory)
-    await memGit.writeFile('README.md', '# My Project');
-    await memGit.writeFile('src/index.js', 'console.log("Hello");');
-    
-    // Git operations (all in memory)
-    await memGit.add('.');
-    await memGit.commit('Initial commit');
-    
-    // Create branch and make changes
-    await memGit.createBranch('feature/new');
-    await memGit.checkout('feature/new');
-    
-    // More changes...
-    await memGit.writeFile('src/feature.js', 'export class Feature {}');
-    await memGit.add('.');
-    await memGit.commit('Add feature');
-    
-    // Merge
-    await memGit.checkout('main');
-    await memGit.merge('feature/new');
-    
-    // ONLY NOW save to disk
-    await memGit.flush('./output-directory');
-}
+const memGit = new MemoryGit('my-project');
+memGit.setAuthor('Your Name', 'email@example.com');
+
+await memGit.init();
+await memGit.writeFile('README.md', '# My Project');
+await memGit.add('README.md');
+await memGit.commit('Initial commit');
+
+// Sync to disk only when ready
+await memGit.flush('./output-directory');
 ```
 
-## Loading Existing Repository
+## Loading an Existing Repository
 
-```javascript
-const memGit = new MemoryGit('loading');
-memGit.setAuthor('Name', 'email@example.com');
-
-// Load from disk to memory
+```typescript
+const memGit = new MemoryGit('my-repo');
 await memGit.loadFromDisk('./my-existing-repo', {
-    ignore: ['node_modules', '.pnpm-store', 'dist']
+    ignore: ['node_modules', 'dist']
 });
 
-// Make changes in memory
-await memGit.writeFile('CHANGELOG.md', '# Changelog\n\n- New version');
-await memGit.add('.');
+await memGit.writeFile('CHANGELOG.md', '# Changelog');
+await memGit.add('CHANGELOG.md');
 await memGit.commit('docs: add changelog');
 
-// Save back to disk
-await memGit.flush();
+await memGit.flush(); // writes back to original path
+```
+
+## Migration from v1 to v2
+
+**Breaking change:** each instance now has its own isolated filesystem volume. In v1, all instances shared a global `memfs` volume, causing interference.
+
+```typescript
+// v2 — instances are fully isolated
+const g1 = new MemoryGit('a');
+const g2 = new MemoryGit('b'); // independent volume, no interference
 ```
 
 ## API
 
-### Initialization
+### Setup
 
 | Method | Description |
 |--------|-------------|
-| `new MemoryGit(name)` | Creates new instance |
-| `setAuthor(name, email)` | Sets author for commits |
-| `init()` | Initializes repository in memory |
-| `loadFromDisk(path, options)` | Loads repository from disk |
-| `clone(url, options)` | Clones remote repository |
-| `clear()` | Clears memory and reinitializes |
+| `new MemoryGit(name?)` | Creates instance with isolated volume |
+| `setAuthor(name, email)` | Sets commit author |
+| `init()` | Initializes empty repository |
+| `loadFromDisk(path, options?)` | Loads repository from disk |
+| `clone(url, options?)` | Clones remote repository |
+| `clear()` | Resets memory state |
+| `flush(targetPath?)` | Syncs memory to disk |
 
 ### File Operations
 
 | Method | Description |
 |--------|-------------|
-| `writeFile(filepath, content)` | Writes file in memory |
-| `readFile(filepath)` | Reads file from memory |
-| `deleteFile(filepath)` | Removes file from memory |
-| `fileExists(filepath)` | Checks if file exists |
-| `listFiles(dir)` | Lists files in directory |
+| `writeFile(filepath, content)` | Writes file |
+| `readFile(filepath)` | Reads file |
+| `deleteFile(filepath)` | Deletes file |
+| `fileExists(filepath)` | Checks existence |
+| `listFiles(dir?, includeGit?)` | Lists files in working tree |
+| `rename(oldPath, newPath)` | Moves file and stages change (`git mv`) |
 
-### Git Operations
+### Staging and Commits
 
 | Method | Description |
 |--------|-------------|
-| `add(filepath)` | Adds to staging |
-| `remove(filepath)` | Removes from staging and working tree |
-| `commit(message)` | Creates commit |
-| `status()` | Gets status |
-| `log(depth)` | Lists commits |
-| `diff()` | Shows changes |
+| `add(filepath)` | Stages file(s) |
+| `remove(filepath)` | Unstages and removes from working tree |
+| `commit(message)` | Creates commit, returns SHA |
+| `status()` | Returns `FileStatus[]` |
+| `diff()` | Returns changed files vs HEAD |
+
+### Refs and History
+
+| Method | Description |
+|--------|-------------|
+| `log(depth?)` | Returns `CommitInfo[]` |
+| `resolveRef(ref?, options?)` | Resolves ref to OID (`git rev-parse`); `short: true` returns 7-char hash |
+| `revList(options?)` | Lists commit OIDs (`git rev-list`) |
+| `readFileAtRef(filepath, ref?, options?)` | Reads file at a ref; `encoding: 'buffer'` returns `Buffer` |
+| `listTrackedFiles(ref?)` | Lists tracked files at ref (`git ls-tree -r`) |
+| `getChangedFiles(fromRef, toRef?, options?)` | Diffs two refs, supports `filter` by status |
+| `reset(ref?, options?)` | Resets to ref — modes: `'soft'` \| `'mixed'` (default) \| `'hard'` |
+| `resetFile(filepath)` | Resets single file to HEAD |
 
 ### Branches
 
@@ -123,10 +115,20 @@ await memGit.flush();
 |--------|-------------|
 | `createBranch(name)` | Creates branch |
 | `deleteBranch(name)` | Deletes branch |
-| `checkout(name)` | Switches to branch |
-| `listBranches()` | Lists branches |
-| `currentBranch()` | Gets current branch |
-| `merge(branch)` | Performs merge |
+| `checkout(name)` | Switches branch |
+| `listBranches()` | Returns `BranchInfo[]` |
+| `currentBranch()` | Returns current branch name |
+| `merge(branch)` | Merges branch |
+
+### Tags
+
+| Method | Description |
+|--------|-------------|
+| `createTag(name, ref?)` | Creates lightweight tag |
+| `listTags()` | Lists tag names |
+| `deleteTag(name)` | Deletes tag (`git tag -d`) |
+| `describeExact(ref?)` | Returns tag at exact ref (`git describe --exact-match --tags`) |
+| `showTagRefs()` | Returns `TagRef[]` with resolved commit OIDs |
 
 ### Remotes
 
@@ -134,9 +136,9 @@ await memGit.flush();
 |--------|-------------|
 | `addRemote(name, url)` | Adds remote |
 | `deleteRemote(name)` | Removes remote |
-| `listRemotes()` | Lists remotes |
-| `fetch(remote)` | Performs fetch |
-| `pull(remote, branch)` | Performs pull |
+| `listRemotes()` | Returns `RemoteInfo[]` |
+| `fetch(remote?)` | Fetches from remote |
+| `pull(remote?, branch?)` | Pulls from remote |
 
 ### Stash
 
@@ -144,119 +146,50 @@ await memGit.flush();
 |--------|-------------|
 | `stash()` | Saves changes to stash |
 | `stashPop()` | Restores from stash |
-| `stashList()` | Counts available stashes |
+| `stashList()` | Returns stash count |
 
-### Synchronization
-
-| Method | Description |
-|--------|-------------|
-| `flush(targetPath)` | Saves everything to disk |
-
-### Logs and Metrics
+### Observability
 
 | Method | Description |
 |--------|-------------|
-| `getOperationsLog()` | Returns operation log |
-| `clearOperationsLog()` | Clears log |
-| `getOperationsStats()` | Operation statistics |
-| `exportOperationsLog()` | Exports log as JSON |
+| `getOperationsLog()` | All recorded operations |
+| `getOperationsStats()` | Aggregated stats by operation |
+| `exportOperationsLog()` | Exports log as JSON string |
+| `clearOperationsLog()` | Clears the log |
 | `getMemoryUsage()` | Estimated memory usage |
-| `getRepoInfo()` | Repository information |
-
-## Operation Logging
-
-All operations are automatically recorded:
-
-```javascript
-const ops = memGit.getOperationsLog();
-// [
-//   {
-//     timestamp: '2024-01-15T10:30:00.000Z',
-//     operation: 'commit',
-//     params: { message: 'feat: add feature' },
-//     success: true,
-//     result: { sha: 'abc123...' },
-//     error: null
-//   },
-//   ...
-// ]
-
-// Statistics
-const stats = memGit.getOperationsStats();
-// {
-//   total: 25,
-//   successful: 24,
-//   failed: 1,
-//   byOperation: {
-//     commit: { total: 5, successful: 5, failed: 0 },
-//     ...
-//   }
-// }
-
-// Export to file
-const json = memGit.exportOperationsLog();
-fs.writeFileSync('operations.json', json);
-```
-
-## Complete Example
-
-Run the included example:
-
-```bash
-pnpm run example
-```
-
-## Benchmark: Git CLI vs MemoryGit
-
-Run the benchmark:
-
-```bash
-pnpm run benchmark
-```
-
-### Summary Results
-
-| Metric | Git CLI | MemoryGit | Difference |
-|--------|---------|-----------|------------|
-| Overhead per call | 3.63ms | 0.03ms | **~100x faster** |
-| Log read (50x) | 232ms | 161ms | **1.4x faster** |
-| Init | 15ms | 2ms | **7x faster** |
-| Create branch | 3ms | 0.5ms | **6x faster** |
-| Add (50 files) | 24ms | 53ms | 2.2x slower |
-| Commit | 8ms | 4ms | **2x faster** |
-
-### Analysis
-
-- **Git CLI** is faster in heavy individual operations (add, checkout) because it's written in highly optimized C
-- **MemoryGit** eliminates process spawn overhead (~3.6ms per call) and disk IO
-- For **repeated reads** (status, log, branches), MemoryGit is significantly faster
-- The final **flush** adds ~60ms to sync with disk
-
-### When to use each
-
-| Scenario | Recommendation |
-|----------|----------------|
-| Large repositories (> 500MB) | Git CLI |
-| Automated tests | MemoryGit |
-| Programmatic repo generation | MemoryGit |
-| Single operations | Git CLI |
-| Many reads (status, log) | MemoryGit |
-| Low latency applications | MemoryGit |
-
-## Dependencies
-
-- [isomorphic-git](https://isomorphic-git.org/) - Pure JavaScript Git implementation
-- [memfs](https://github.com/streamich/memfs) - In-memory filesystem
+| `getRepoInfo()` | Repository summary |
 
 ## TypeScript
 
-The package includes complete TypeScript definitions:
+All types are exported:
 
 ```typescript
-import { MemoryGit, CommitInfo, FileStatus } from 'memory-git';
-
-const memGit = new MemoryGit('my-project');
+import {
+    MemoryGit,
+    CommitInfo, FileStatus, BranchInfo, RemoteInfo,
+    TagRef, ChangedFile, RevListOptions,
+    ResetMode, ResetOptions, DiffEntry,
+    MergeResult, MemoryUsage, RepoInfo
+} from 'memory-git';
 ```
+
+## Benchmark
+
+Run `pnpm run benchmark` to compare against the real git CLI:
+
+| Metric | Git CLI | MemoryGit |
+|--------|---------|-----------|
+| Overhead per call | 3.63ms | 0.03ms |
+| Init | 15ms | 2ms |
+| Commit | 8ms | 4ms |
+| Log (50x) | 232ms | 161ms |
+
+The main gain is eliminating process spawn overhead (~3.6ms per call). MemoryGit is ideal for test suites that call git repeatedly.
+
+## Dependencies
+
+- [isomorphic-git](https://isomorphic-git.org/) — pure JS Git implementation
+- [memfs](https://github.com/streamich/memfs) — in-memory filesystem
 
 ## License
 

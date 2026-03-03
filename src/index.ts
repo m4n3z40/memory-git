@@ -1,8 +1,10 @@
 import git from 'isomorphic-git';
 import http from 'isomorphic-git/http/node';
-import { fs as memfs, vol } from 'memfs';
+import { createFsFromVolume, Volume } from 'memfs';
 import { promises as fsRealAsync } from 'fs';
 import pathNode from 'path';
+
+type MemFs = ReturnType<typeof createFsFromVolume>;
 
 // Types
 export interface Author {
@@ -99,6 +101,29 @@ export interface DiffEntry {
     status: string;
 }
 
+export type ResetMode = 'soft' | 'mixed' | 'hard';
+
+export interface ResetOptions {
+    mode?: ResetMode;
+}
+
+export interface TagRef {
+    tagName: string;
+    commitOid: string;
+}
+
+export interface ChangedFile {
+    filepath: string;
+    status: 'added' | 'modified' | 'deleted' | 'renamed';
+}
+
+export interface RevListOptions {
+    all?: boolean;
+    reverse?: boolean;
+    maxCount?: number;
+    ref?: string;
+}
+
 interface StashedFile {
     filepath: string;
     content?: Buffer | string;
@@ -118,9 +143,9 @@ export class MemoryGit {
     /** Instance name */
     readonly name: string;
     /** Memory filesystem */
-    readonly fs: typeof memfs;
+    readonly fs: MemFs;
     /** Volume instance */
-    readonly vol: typeof vol;
+    readonly vol: InstanceType<typeof Volume>;
     /** In-memory repository directory */
     readonly dir: string = '/repo';
     /** Real disk directory (if loaded from disk) */
@@ -139,11 +164,8 @@ export class MemoryGit {
      */
     constructor(name: string = 'memory-git') {
         this.name = name;
-        this.fs = memfs;
-        this.vol = vol;
-        
-        // Clear volume to ensure clean state
-        this.vol.reset();
+        this.vol = new Volume();
+        this.fs = createFsFromVolume(this.vol);
     }
 
     /**
@@ -675,6 +697,310 @@ export class MemoryGit {
     }
 
     /**
+     * Resolves any ref (HEAD, branch, tag, short hash) to a full OID
+     * Equivalent to git rev-parse
+     * @param ref - Reference to resolve (default: 'HEAD')
+     * @param options - Options (short: return first 7 chars)
+     * @returns Full OID (or 7-char short OID)
+     */
+    async resolveRef(ref: string = 'HEAD', options?: { short?: boolean }): Promise<string> {
+        try {
+            const oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref });
+            const result = options?.short ? oid.slice(0, 7) : oid;
+            this._logOperation('resolveRef', { ref, options }, { success: true, oid: result });
+            return result;
+        } catch (error) {
+            this._logOperation('resolveRef', { ref, options }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Deletes a tag
+     * Equivalent to git tag -d <tagName>
+     * @param tagName - Tag name to delete
+     */
+    async deleteTag(tagName: string): Promise<boolean> {
+        try {
+            const tags = await git.listTags({ fs: this.fs, dir: this.dir });
+            if (!tags.includes(tagName)) {
+                throw new Error(`Tag not found: ${tagName}`);
+            }
+            await git.deleteRef({ fs: this.fs, dir: this.dir, ref: `refs/tags/${tagName}` });
+            this._logOperation('deleteTag', { tagName }, { success: true });
+            return true;
+        } catch (error) {
+            this._logOperation('deleteTag', { tagName }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Resets the current branch to the specified ref
+     * Equivalent to git reset [--soft | --mixed | --hard] <ref>
+     * @param ref - Reference to reset to (default: 'HEAD')
+     * @param options - Reset options (mode: 'soft' | 'mixed' | 'hard', default: 'mixed')
+     * @returns OID of the target commit
+     */
+    async reset(ref: string = 'HEAD', options?: ResetOptions): Promise<string> {
+        const mode = options?.mode ?? 'mixed';
+        try {
+            const oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref });
+            const branch = await git.currentBranch({ fs: this.fs, dir: this.dir });
+
+            if (branch) {
+                await git.writeRef({
+                    fs: this.fs,
+                    dir: this.dir,
+                    ref: `refs/heads/${branch}`,
+                    value: oid,
+                    force: true
+                });
+            }
+
+            if (mode === 'hard') {
+                await git.checkout({ fs: this.fs, dir: this.dir, ref: oid, force: true });
+            } else if (mode === 'mixed') {
+                // Update index to match the target commit tree, leave working tree untouched
+                const files = await git.listFiles({ fs: this.fs, dir: this.dir, ref: oid });
+                for (const filepath of files) {
+                    try {
+                        await git.resetIndex({ fs: this.fs, dir: this.dir, filepath });
+                    } catch {
+                        // Skip files that can't be processed
+                    }
+                }
+                // Also reset any staged files not in the target commit
+                const statusMatrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
+                for (const [filepath, head, , stage] of statusMatrix) {
+                    if (stage !== head) {
+                        try {
+                            await git.resetIndex({ fs: this.fs, dir: this.dir, filepath: filepath as string });
+                        } catch {
+                            // Skip
+                        }
+                    }
+                }
+            }
+            // soft: only branch pointer was moved, index and working tree unchanged
+
+            this._logOperation('reset', { ref, mode }, { success: true, oid });
+            return oid;
+        } catch (error) {
+            this._logOperation('reset', { ref, mode }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Renames a file and stages the change (equivalent to git mv)
+     * Staging is automatic, consistent with real git mv behavior
+     * @param oldPath - Current file path (relative)
+     * @param newPath - New file path (relative)
+     */
+    async rename(oldPath: string, newPath: string): Promise<boolean> {
+        try {
+            const fullOldPath = pathNode.posix.join(this.dir, oldPath);
+            const fullNewPath = pathNode.posix.join(this.dir, newPath);
+
+            const content = this.fs.readFileSync(fullOldPath);
+
+            const newDir = pathNode.posix.dirname(fullNewPath);
+            this.fs.mkdirSync(newDir, { recursive: true });
+
+            this.fs.writeFileSync(fullNewPath, content as Buffer);
+            this.fs.unlinkSync(fullOldPath);
+
+            await git.remove({ fs: this.fs, dir: this.dir, filepath: oldPath });
+            await git.add({ fs: this.fs, dir: this.dir, filepath: newPath });
+
+            this._logOperation('rename', { oldPath, newPath }, { success: true });
+            return true;
+        } catch (error) {
+            this._logOperation('rename', { oldPath, newPath }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Returns the tag that points exactly to the specified ref (equivalent to git describe --exact-match --tags)
+     * @param ref - Reference to check (default: 'HEAD')
+     * @returns Tag name or null if no tag points to that commit
+     */
+    async describeExact(ref: string = 'HEAD'): Promise<string | null> {
+        try {
+            const oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref });
+            const tagRefs = await this.showTagRefs();
+            const match = tagRefs.find(t => t.commitOid === oid);
+            const result = match?.tagName ?? null;
+            this._logOperation('describeExact', { ref }, { success: true, tag: result });
+            return result;
+        } catch (error) {
+            this._logOperation('describeExact', { ref }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Lists all tag references resolving annotated tags to their target commit OID
+     * Equivalent to git show-ref --tags -d
+     * @returns List of tag references with their commit OIDs
+     */
+    async showTagRefs(): Promise<TagRef[]> {
+        try {
+            const tags = await git.listTags({ fs: this.fs, dir: this.dir });
+            const result: TagRef[] = [];
+
+            for (const tagName of tags) {
+                const oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: `refs/tags/${tagName}` });
+                let commitOid = oid;
+                try {
+                    const obj = await git.readTag({ fs: this.fs, dir: this.dir, oid });
+                    commitOid = obj.tag.object;
+                } catch {
+                    // Lightweight tag — oid is already the commit
+                }
+                result.push({ tagName, commitOid });
+            }
+
+            this._logOperation('showTagRefs', {}, { success: true, count: result.length });
+            return result;
+        } catch (error) {
+            this._logOperation('showTagRefs', {}, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Lists all tracked files at a given ref (equivalent to git ls-tree -r --name-only)
+     * @param ref - Reference (default: 'HEAD')
+     * @returns List of tracked file paths
+     */
+    async listTrackedFiles(ref: string = 'HEAD'): Promise<string[]> {
+        try {
+            const files = await git.listFiles({ fs: this.fs, dir: this.dir, ref });
+            this._logOperation('listTrackedFiles', { ref }, { success: true, count: files.length });
+            return files;
+        } catch (error) {
+            this._logOperation('listTrackedFiles', { ref }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Returns the list of files changed between two refs
+     * Uses git.walk to compare tree objects
+     * @param fromRef - Base reference for comparison
+     * @param toRef - Target reference (default: 'HEAD')
+     * @param options - Filter options
+     * @returns List of changed files with their status
+     */
+    async getChangedFiles(
+        fromRef: string,
+        toRef: string = 'HEAD',
+        options?: { filter?: Array<'added' | 'modified' | 'deleted' | 'renamed'> }
+    ): Promise<ChangedFile[]> {
+        try {
+            const fromOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: fromRef });
+            const toOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: toRef });
+
+            const changes: ChangedFile[] = [];
+
+            await git.walk({
+                fs: this.fs,
+                dir: this.dir,
+                trees: [git.TREE({ ref: fromOid }), git.TREE({ ref: toOid })],
+                map: async (filepath, [fromEntry, toEntry]) => {
+                    if (filepath === '.') return;
+
+                    const fromType = fromEntry ? await fromEntry.type() : null;
+                    const toType = toEntry ? await toEntry.type() : null;
+
+                    // Skip directories
+                    if (fromType === 'tree' || toType === 'tree') return;
+
+                    if (!fromEntry && toEntry) {
+                        changes.push({ filepath, status: 'added' });
+                    } else if (fromEntry && !toEntry) {
+                        changes.push({ filepath, status: 'deleted' });
+                    } else if (fromEntry && toEntry) {
+                        const fromOidEntry = await fromEntry.oid();
+                        const toOidEntry = await toEntry.oid();
+                        if (fromOidEntry !== toOidEntry) {
+                            changes.push({ filepath, status: 'modified' });
+                        }
+                    }
+                }
+            });
+
+            const result = options?.filter
+                ? changes.filter(c => options.filter!.includes(c.status))
+                : changes;
+
+            this._logOperation('getChangedFiles', { fromRef, toRef, options }, { success: true, count: result.length });
+            return result;
+        } catch (error) {
+            this._logOperation('getChangedFiles', { fromRef, toRef, options }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Lists commit OIDs (equivalent to git rev-list)
+     * @param options - Options for filtering and ordering
+     * @returns List of commit OIDs
+     */
+    async revList(options?: RevListOptions): Promise<string[]> {
+        try {
+            const ref = options?.ref ?? 'HEAD';
+
+            let oids: string[] = [];
+
+            if (options?.all) {
+                const branches = await git.listBranches({ fs: this.fs, dir: this.dir });
+                const seen = new Set<string>();
+                // Note: ordering with all:true is per-branch, not topological
+                for (const branch of branches) {
+                    try {
+                        const commits = await git.log({
+                            fs: this.fs,
+                            dir: this.dir,
+                            ref: branch,
+                            depth: options.maxCount
+                        });
+                        for (const c of commits) {
+                            if (!seen.has(c.oid)) {
+                                seen.add(c.oid);
+                                oids.push(c.oid);
+                            }
+                        }
+                    } catch {
+                        // Skip branches without commits
+                    }
+                }
+            } else {
+                const commits = await git.log({
+                    fs: this.fs,
+                    dir: this.dir,
+                    ref,
+                    depth: options?.maxCount
+                });
+                oids = commits.map(c => c.oid);
+            }
+
+            if (options?.reverse) {
+                oids = oids.reverse();
+            }
+
+            this._logOperation('revList', { options }, { success: true, count: oids.length });
+            return oids;
+        } catch (error) {
+            this._logOperation('revList', { options }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
      * Returns the history of all operations performed
      * @returns List of operations
      */
@@ -872,9 +1198,10 @@ export class MemoryGit {
      * Gets file content at a specific commit
      * @param filepath - File path
      * @param ref - Reference (commit SHA, branch, tag)
-     * @returns File content
+     * @param options - Encoding options ('utf8' returns string, 'buffer' returns Buffer)
+     * @returns File content as string (default) or Buffer
      */
-    async readFileAtRef(filepath: string, ref: string = 'HEAD'): Promise<string> {
+    async readFileAtRef(filepath: string, ref: string = 'HEAD', options?: { encoding?: 'utf8' | 'buffer' }): Promise<string | Buffer> {
         try {
             const { blob } = await git.readBlob({
                 fs: this.fs,
@@ -882,10 +1209,13 @@ export class MemoryGit {
                 oid: await git.resolveRef({ fs: this.fs, dir: this.dir, ref }),
                 filepath
             });
-            
-            const content = Buffer.from(blob).toString('utf8');
+
+            const result: string | Buffer = options?.encoding === 'buffer'
+                ? Buffer.from(blob)
+                : Buffer.from(blob).toString('utf8');
+
             this._logOperation('readFileAtRef', { filepath, ref }, { success: true });
-            return content;
+            return result;
         } catch (error) {
             this._logOperation('readFileAtRef', { filepath, ref }, null, error as Error);
             throw error;
