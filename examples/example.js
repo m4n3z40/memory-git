@@ -1,4 +1,7 @@
-const { MemoryGit } = require('./index');
+const path = require('path');
+const { MemoryGit } = require('..');
+
+const OUTPUT_REPO = path.join(__dirname, 'output-repo');
 
 /**
  * MemoryGit usage example
@@ -147,9 +150,8 @@ Added Feature class for demonstration.
         
         // 13. Flush to disk
         console.log('\n💾 Saving repository to disk...');
-        const outputPath = './output-repo';
-        const filesFlushed = await memGit.flush(outputPath);
-        console.log(`   Repository saved to: ${outputPath}`);
+        const filesFlushed = await memGit.flush(OUTPUT_REPO);
+        console.log(`   Repository saved to: ${OUTPUT_REPO}`);
         console.log(`   Files written: ${filesFlushed}`);
         
         // 14. Show complete operation log (last 10)
@@ -189,7 +191,7 @@ async function loadExistingRepo() {
     try {
         // Load an existing repository from disk
         console.log('\n📂 Loading repository from disk...');
-        const filesLoaded = await memGit.loadFromDisk('./output-repo');
+        const filesLoaded = await memGit.loadFromDisk(OUTPUT_REPO);
         console.log(`   Files loaded: ${filesLoaded}`);
         
         // Make modifications in memory
@@ -227,8 +229,9 @@ async function loadExistingRepo() {
         // Export operation log (async)
         console.log('\n📄 Exporting operation log to file...');
         const logJson = memGit.exportOperationsLog();
-        await require('fs').promises.writeFile('./output-repo/operations-log.json', logJson);
-        console.log('   Log exported to: ./output-repo/operations-log.json');
+        const logPath = path.join(OUTPUT_REPO, 'operations-log.json');
+        await require('fs').promises.writeFile(logPath, logJson);
+        console.log(`   Log exported to: ${logPath}`);
         
     } catch (error) {
         console.error('Error:', error.message);

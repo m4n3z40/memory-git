@@ -19,8 +19,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "clean": "rm -rf dist",
-    "example": "node example.js",
-    "benchmark": "node benchmark.js",
+    "example": "node examples/example.js",
+    "benchmark": "node benchmarks/benchmark.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
@@ -52,15 +52,15 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "packageManager": "pnpm@10.25.0",
+  "packageManager": "pnpm@11.1.1",
   "dependencies": {
-    "isomorphic-git": "^1.37.4",
-    "memfs": "^4.57.1"
+    "isomorphic-git": "^1.37.6",
+    "memfs": "^4.57.2"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
-    "@vitest/coverage-v8": "4.1.0",
-    "typescript": "^5.9.3",
-    "vitest": "^4.1.0"
+    "@types/node": "^25.7.0",
+    "@vitest/coverage-v8": "4.1.6",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
   }
 }

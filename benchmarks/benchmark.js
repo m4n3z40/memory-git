@@ -1,4 +1,4 @@
-const { MemoryGit } = require('./index');
+const { MemoryGit } = require('..');
 const { execSync } = require('child_process');
 const fs = require('fs').promises;
 const path = require('path');

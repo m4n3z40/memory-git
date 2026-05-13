@@ -1,4 +1,4 @@
-output-repo
+examples/output-repo
 node_modules
 .pnpm-store
 coverage
