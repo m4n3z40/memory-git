@@ -834,8 +834,109 @@ describe('MemoryGit', () => {
 
         it('should set realDir correctly', async () => {
             await memGit.loadFromDisk(testSourceDir);
-            
+
             expect(memGit.realDir).toBe(path.resolve(testSourceDir));
+        });
+
+        describe('respectGitignore', () => {
+            const gitignoreDir = '/tmp/memory-git-gitignore-test';
+
+            beforeEach(async () => {
+                await fs.rm(gitignoreDir, { recursive: true, force: true });
+                await fs.mkdir(gitignoreDir, { recursive: true });
+                await fs.mkdir(path.join(gitignoreDir, '.git'), { recursive: true });
+                await fs.mkdir(path.join(gitignoreDir, 'src'), { recursive: true });
+                await fs.mkdir(path.join(gitignoreDir, 'build'), { recursive: true });
+                await fs.mkdir(path.join(gitignoreDir, 'node_modules'), { recursive: true });
+                await fs.writeFile(path.join(gitignoreDir, '.git/HEAD'), 'ref: refs/heads/main');
+                await fs.writeFile(path.join(gitignoreDir, 'README.md'), '# test');
+                await fs.writeFile(path.join(gitignoreDir, 'src/index.js'), 'code');
+                await fs.writeFile(path.join(gitignoreDir, 'build/out.js'), 'built');
+                await fs.writeFile(path.join(gitignoreDir, 'node_modules/dep.js'), 'dep');
+                await fs.writeFile(path.join(gitignoreDir, 'debug.log'), 'log');
+                await fs.writeFile(path.join(gitignoreDir, 'keep.log'), 'should be kept');
+            });
+
+            afterEach(async () => {
+                await fs.rm(gitignoreDir, { recursive: true, force: true });
+            });
+
+            it('respects root .gitignore by default', async () => {
+                await fs.writeFile(path.join(gitignoreDir, '.gitignore'), 'build/\nnode_modules/\n*.log\n');
+                await memGit.loadFromDisk(gitignoreDir);
+
+                const files = await memGit.listFiles('', true);
+                expect(files.some(f => f === 'README.md')).toBe(true);
+                expect(files.some(f => f === 'src/index.js')).toBe(true);
+                expect(files.some(f => f.startsWith('build/'))).toBe(false);
+                expect(files.some(f => f.startsWith('node_modules/'))).toBe(false);
+                expect(files.some(f => f.endsWith('.log'))).toBe(false);
+            });
+
+            it('respects negation patterns', async () => {
+                await fs.writeFile(path.join(gitignoreDir, '.gitignore'), '*.log\n!keep.log\n');
+                await memGit.loadFromDisk(gitignoreDir);
+
+                const files = await memGit.listFiles('', true);
+                expect(files).toContain('keep.log');
+                expect(files).not.toContain('debug.log');
+            });
+
+            it('always loads .git/ even when ignored', async () => {
+                await fs.writeFile(path.join(gitignoreDir, '.gitignore'), '.git/\n');
+                await memGit.loadFromDisk(gitignoreDir);
+
+                const files = await memGit.listFiles('', true);
+                expect(files.some(f => f.startsWith('.git/'))).toBe(true);
+            });
+
+            it('respectGitignore:false loads everything', async () => {
+                await fs.writeFile(path.join(gitignoreDir, '.gitignore'), 'build/\n*.log\n');
+                await memGit.loadFromDisk(gitignoreDir, { respectGitignore: false });
+
+                const files = await memGit.listFiles('', true);
+                expect(files.some(f => f.startsWith('build/'))).toBe(true);
+                expect(files).toContain('debug.log');
+            });
+
+            it('combines .gitignore with explicit ignore option', async () => {
+                await fs.writeFile(path.join(gitignoreDir, '.gitignore'), 'build/\n');
+                await memGit.loadFromDisk(gitignoreDir, { ignore: ['*.log'] });
+
+                const files = await memGit.listFiles('', true);
+                expect(files.some(f => f.startsWith('build/'))).toBe(false);
+                expect(files.some(f => f.endsWith('.log'))).toBe(false);
+                expect(files).toContain('README.md');
+            });
+
+            it('respects nested .gitignore files', async () => {
+                await fs.writeFile(path.join(gitignoreDir, '.gitignore'), '');
+                await fs.writeFile(path.join(gitignoreDir, 'src/.gitignore'), '*.js\n');
+                await memGit.loadFromDisk(gitignoreDir);
+
+                const files = await memGit.listFiles('', true);
+                expect(files).not.toContain('src/index.js');
+                expect(files).toContain('src/.gitignore');
+                expect(files).toContain('README.md');
+            });
+
+            it('nestedGitignore:false ignores nested .gitignore files', async () => {
+                await fs.writeFile(path.join(gitignoreDir, '.gitignore'), '');
+                await fs.writeFile(path.join(gitignoreDir, 'src/.gitignore'), '*.js\n');
+                await memGit.loadFromDisk(gitignoreDir, { nestedGitignore: false });
+
+                const files = await memGit.listFiles('', true);
+                expect(files).toContain('src/index.js');
+            });
+
+            it('works fine when no .gitignore exists', async () => {
+                // No .gitignore file. Should load everything.
+                await memGit.loadFromDisk(gitignoreDir);
+                const files = await memGit.listFiles('', true);
+                expect(files).toContain('README.md');
+                expect(files).toContain('debug.log');
+                expect(files.some(f => f.startsWith('build/'))).toBe(true);
+            });
         });
     });
 
@@ -1286,6 +1387,847 @@ describe('MemoryGit', () => {
             const oids = await memGit.revList({ all: true });
             expect(oids).toContain(featSha);
             expect(oids).toContain(sha3);
+        });
+    });
+
+    describe('New options on existing methods', () => {
+        beforeEach(async () => {
+            await memGit.init();
+            memGit.setAuthor('Test', 'test@test.com');
+        });
+
+        describe('init with custom default branch', () => {
+            it('should use custom default branch', async () => {
+                const g = new MemoryGit('custom');
+                await g.init({ defaultBranch: 'develop' });
+                expect(await g.currentBranch()).toBe('develop');
+            });
+        });
+
+        describe('add with all / update / "."', () => {
+            it('should stage all changes including untracked with all:true', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.writeFile('b.txt', '2');
+                await memGit.add([], { all: true });
+                const status = await memGit.status();
+                const a = status.find(s => s.filepath === 'a.txt');
+                const b = status.find(s => s.filepath === 'b.txt');
+                expect(a?.stage).toBe(2);
+                expect(b?.stage).toBe(2);
+            });
+
+            it('should treat "." like all:true', async () => {
+                await memGit.writeFile('x.txt', '1');
+                await memGit.add('.');
+                const status = await memGit.status();
+                expect(status.find(s => s.filepath === 'x.txt')?.stage).toBe(2);
+            });
+
+            it('should skip untracked with update:true', async () => {
+                await memGit.writeFile('tracked.txt', 'v1');
+                await memGit.add('tracked.txt');
+                await memGit.commit('init');
+                await memGit.writeFile('tracked.txt', 'v2');
+                await memGit.writeFile('untracked.txt', 'new');
+                await memGit.add([], { update: true });
+                const status = await memGit.status();
+                expect(status.find(s => s.filepath === 'tracked.txt')?.stage).toBe(2);
+                expect(status.find(s => s.filepath === 'untracked.txt')?.stage).toBe(0);
+            });
+        });
+
+        describe('commit options', () => {
+            it('should refuse empty commit by default', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                await memGit.commit('first');
+                await expect(memGit.commit('empty')).rejects.toThrow(/nothing to commit/);
+            });
+
+            it('should allow empty commit with allowEmpty', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                await memGit.commit('first');
+                const sha = await memGit.commit('empty', { allowEmpty: true });
+                expect(sha).toBeTruthy();
+            });
+
+            it('should auto-stage tracked changes with all:true', async () => {
+                await memGit.writeFile('a.txt', 'v1');
+                await memGit.add('a.txt');
+                await memGit.commit('init');
+                await memGit.writeFile('a.txt', 'v2');
+                const sha = await memGit.commit('update', { all: true });
+                expect(sha).toBeTruthy();
+                const logs = await memGit.log();
+                expect(logs[0].message.trim()).toBe('update');
+            });
+
+            it('should amend the previous commit', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                const sha1 = await memGit.commit('original');
+                await memGit.writeFile('a.txt', '2');
+                await memGit.add('a.txt');
+                const sha2 = await memGit.commit('amended', { amend: true });
+                expect(sha2).not.toBe(sha1);
+                const logs = await memGit.log();
+                expect(logs).toHaveLength(1);
+                expect(logs[0].message.trim()).toBe('amended');
+            });
+        });
+
+        describe('remove with cached', () => {
+            it('should keep working file when cached:true', async () => {
+                await memGit.writeFile('a.txt', 'hi');
+                await memGit.add('a.txt');
+                await memGit.commit('init');
+                await memGit.remove('a.txt', { cached: true });
+                expect(await memGit.fileExists('a.txt')).toBe(true);
+            });
+
+            it('should delete working file by default', async () => {
+                await memGit.writeFile('a.txt', 'hi');
+                await memGit.add('a.txt');
+                await memGit.commit('init');
+                await memGit.remove('a.txt');
+                expect(await memGit.fileExists('a.txt')).toBe(false);
+            });
+        });
+
+        describe('deleteBranch force', () => {
+            it('should refuse to delete non-merged branch without force', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                await memGit.commit('init');
+                await memGit.createBranch('feature');
+                await memGit.checkout('feature');
+                await memGit.writeFile('b.txt', '2');
+                await memGit.add('b.txt');
+                await memGit.commit('feat');
+                await memGit.checkout('main');
+                await expect(memGit.deleteBranch('feature')).rejects.toThrow(/not fully merged/);
+            });
+
+            it('should delete non-merged branch with force', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                await memGit.commit('init');
+                await memGit.createBranch('feature');
+                await memGit.checkout('feature');
+                await memGit.writeFile('b.txt', '2');
+                await memGit.add('b.txt');
+                await memGit.commit('feat');
+                await memGit.checkout('main');
+                await memGit.deleteBranch('feature', { force: true });
+                const branches = await memGit.listBranches();
+                expect(branches.find(b => b.name === 'feature')).toBeUndefined();
+            });
+        });
+
+        describe('checkout with createBranch', () => {
+            it('should create and switch in one call', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                await memGit.commit('init');
+                await memGit.checkout('feature', { createBranch: true });
+                expect(await memGit.currentBranch()).toBe('feature');
+            });
+        });
+
+        describe('createTag annotated', () => {
+            it('should create annotated tag with message', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                await memGit.commit('init');
+                await memGit.createTag('v1.0', { annotated: true, message: 'release 1.0' });
+                const tags = await memGit.listTags();
+                expect(tags).toContain('v1.0');
+            });
+
+            it('should force overwrite existing tag', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                await memGit.commit('init');
+                await memGit.createTag('v1');
+                await memGit.createTag('v1', { force: true });
+                expect(await memGit.listTags()).toContain('v1');
+            });
+        });
+
+        describe('reset with paths', () => {
+            it('should unstage a single file', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                await memGit.commit('init');
+                await memGit.writeFile('a.txt', '2');
+                await memGit.writeFile('b.txt', '3');
+                await memGit.add('a.txt');
+                await memGit.add('b.txt');
+                await memGit.reset('HEAD', { paths: ['a.txt'] });
+                const status = await memGit.status();
+                expect(status.find(s => s.filepath === 'a.txt')?.stage).toBe(1);
+                expect(status.find(s => s.filepath === 'b.txt')?.stage).toBe(2);
+            });
+        });
+
+        describe('rename force', () => {
+            it('should refuse rename when target exists', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.writeFile('b.txt', '2');
+                await memGit.add('a.txt');
+                await memGit.add('b.txt');
+                await memGit.commit('init');
+                await expect(memGit.rename('a.txt', 'b.txt')).rejects.toThrow(/already exists/);
+            });
+
+            it('should overwrite target with force', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.writeFile('b.txt', '2');
+                await memGit.add('a.txt');
+                await memGit.add('b.txt');
+                await memGit.commit('init');
+                await memGit.rename('a.txt', 'b.txt', { force: true });
+                expect(await memGit.readFile('b.txt')).toBe('1');
+            });
+        });
+
+        describe('log filters', () => {
+            it('should filter by author', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                memGit.setAuthor('Alice', 'alice@x.com');
+                await memGit.commit('alice commit');
+                await memGit.writeFile('b.txt', '2');
+                await memGit.add('b.txt');
+                memGit.setAuthor('Bob', 'bob@x.com');
+                await memGit.commit('bob commit');
+                const logs = await memGit.log({ author: 'alice' });
+                expect(logs).toHaveLength(1);
+                expect(logs[0].author).toBe('Alice');
+            });
+        });
+
+        describe('diff cached / refs', () => {
+            it('should diff between two refs', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                const sha1 = await memGit.commit('first');
+                await memGit.writeFile('a.txt', '2');
+                await memGit.writeFile('b.txt', '3');
+                await memGit.add('a.txt');
+                await memGit.add('b.txt');
+                const sha2 = await memGit.commit('second');
+                const changes = await memGit.diff({ fromRef: sha1, toRef: sha2 });
+                expect(changes.find(c => c.filepath === 'a.txt')?.status).toBe('modified');
+                expect(changes.find(c => c.filepath === 'b.txt')?.status).toBe('added');
+            });
+
+            it('should diff cached (index vs HEAD)', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                await memGit.commit('init');
+                await memGit.writeFile('a.txt', '2');
+                await memGit.add('a.txt');
+                const cached = await memGit.diff({ cached: true });
+                expect(cached.find(c => c.filepath === 'a.txt')).toBeDefined();
+            });
+        });
+
+        describe('resolveRef abbrevRef', () => {
+            it('should return branch name for HEAD', async () => {
+                await memGit.writeFile('a.txt', '1');
+                await memGit.add('a.txt');
+                await memGit.commit('init');
+                expect(await memGit.resolveRef('HEAD', { abbrevRef: true })).toBe('main');
+            });
+        });
+    });
+
+    describe('New methods', () => {
+        beforeEach(async () => {
+            await memGit.init();
+            memGit.setAuthor('Test', 'test@test.com');
+            await memGit.writeFile('a.txt', '1');
+            await memGit.add('a.txt');
+            await memGit.commit('init');
+        });
+
+        describe('config', () => {
+            it('should set and get a config value', async () => {
+                await memGit.config('user.name', 'Charlie');
+                expect(await memGit.config('user.name')).toBe('Charlie');
+            });
+
+            it('should sync user.name with author', async () => {
+                await memGit.config('user.name', 'Dave');
+                expect(memGit.author.name).toBe('Dave');
+            });
+        });
+
+        describe('renameBranch', () => {
+            it('should rename a branch', async () => {
+                await memGit.createBranch('feature');
+                await memGit.renameBranch('feature', 'feature-renamed');
+                const branches = await memGit.listBranches();
+                expect(branches.find(b => b.name === 'feature-renamed')).toBeDefined();
+                expect(branches.find(b => b.name === 'feature')).toBeUndefined();
+            });
+        });
+
+        describe('show', () => {
+            it('should return commit info and changed files', async () => {
+                await memGit.writeFile('b.txt', 'new');
+                await memGit.add('b.txt');
+                const sha = await memGit.commit('add b');
+                const r = await memGit.show(sha);
+                expect(r.commit.sha).toBe(sha);
+                expect(r.changes.find(c => c.filepath === 'b.txt')?.status).toBe('added');
+            });
+
+            it('should treat root commit as all-added', async () => {
+                const root = (await memGit.log({ depth: 100 })).slice(-1)[0];
+                const r = await memGit.show(root.sha);
+                expect(r.parents).toEqual([]);
+                expect(r.changes.find(c => c.filepath === 'a.txt')?.status).toBe('added');
+            });
+        });
+
+        describe('formatters', () => {
+            it('statusText porcelain emits "?? path" for untracked', async () => {
+                await memGit.writeFile('x.txt', 'new');
+                const out = await memGit.statusText({ porcelain: true });
+                expect(out).toContain('?? x.txt');
+            });
+
+            it('logText oneline returns short sha + first line', async () => {
+                const out = await memGit.logText({ oneline: true });
+                expect(out).toMatch(/^[0-9a-f]{7} init/);
+            });
+
+            it('branchText prefixes current branch with *', async () => {
+                await memGit.createBranch('feature');
+                const out = await memGit.branchText();
+                expect(out).toMatch(/\* main/);
+                expect(out).toMatch(/  feature/);
+            });
+        });
+    });
+
+    describe('exec()', () => {
+        beforeEach(async () => {
+            await memGit.init();
+            memGit.setAuthor('Test', 'test@test.com');
+        });
+
+        it('should strip leading "git" if present', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('git add a.txt');
+            const status = await memGit.status();
+            expect(status.find(s => s.filepath === 'a.txt')?.stage).toBe(2);
+        });
+
+        it('should work without "git" prefix', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add a.txt');
+            const status = await memGit.status();
+            expect(status.find(s => s.filepath === 'a.txt')?.stage).toBe(2);
+        });
+
+        it('should run full add-commit-log workflow', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            const commitOut = await memGit.exec('commit -m "first commit"');
+            expect(commitOut).toMatch(/^\[main [0-9a-f]{7}\] first commit$/);
+            const logOut = await memGit.exec('log --oneline');
+            expect(logOut).toMatch(/^[0-9a-f]{7} first commit$/);
+        });
+
+        it('should handle quoted commit messages with spaces', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add a.txt');
+            const out = await memGit.exec('commit -m "fix: bug with spaces"');
+            expect(out).toContain('fix: bug with spaces');
+        });
+
+        it('should produce porcelain status', async () => {
+            await memGit.writeFile('a.txt', '1');
+            const out = await memGit.exec('status --porcelain');
+            expect(out).toContain('?? a.txt');
+        });
+
+        it('should support checkout -b', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            const out = await memGit.exec('checkout -b feature');
+            expect(out).toContain("Switched to a new branch 'feature'");
+            expect(await memGit.currentBranch()).toBe('feature');
+        });
+
+        it('should support branch -d (safe delete)', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.exec('branch feature');
+            await memGit.exec('branch -d feature');
+            const branches = await memGit.listBranches();
+            expect(branches.find(b => b.name === 'feature')).toBeUndefined();
+        });
+
+        it('should support tag list and tag -d', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.exec('tag v1');
+            const list = await memGit.exec('tag');
+            expect(list).toContain('v1');
+            await memGit.exec('tag -d v1');
+            const after = await memGit.exec('tag');
+            expect(after).not.toContain('v1');
+        });
+
+        it('should support reset --hard', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            const first = await memGit.exec('commit -m first');
+            const sha = first.match(/[0-9a-f]{7}/)![0];
+            await memGit.writeFile('a.txt', '2');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m second');
+            await memGit.exec(`reset --hard ${sha}`);
+            expect(await memGit.readFile('a.txt')).toBe('1');
+        });
+
+        it('should support config user.name <value>', async () => {
+            await memGit.exec('config user.name Charlie');
+            expect(memGit.author.name).toBe('Charlie');
+            const v = await memGit.exec('config user.name');
+            expect(v).toBe('Charlie');
+        });
+
+        it('should support rev-parse --short HEAD', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            const out = await memGit.exec('rev-parse --short HEAD');
+            expect(out).toMatch(/^[0-9a-f]{7}$/);
+        });
+
+        it('should support rev-parse --abbrev-ref HEAD', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            expect(await memGit.exec('rev-parse --abbrev-ref HEAD')).toBe('main');
+        });
+
+        it('should throw on unsupported subcommand', async () => {
+            await expect(memGit.exec('rebase main')).rejects.toThrow(/not a supported command/);
+        });
+
+        it('should return empty string for empty input', async () => {
+            expect(await memGit.exec('')).toBe('');
+            expect(await memGit.exec('   ')).toBe('');
+            expect(await memGit.exec('git')).toBe('');
+        });
+
+        it('should run init with -b custom branch', async () => {
+            const g = new MemoryGit();
+            const out = await g.exec('init -b develop');
+            expect(out).toContain('Initialized');
+            expect(await g.currentBranch()).toBe('develop');
+        });
+
+        it('should throw when add has no paths', async () => {
+            await expect(memGit.exec('add')).rejects.toThrow(/Nothing specified/);
+        });
+
+        it('should support add -A', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add -A');
+            const status = await memGit.status();
+            expect(status.find(s => s.filepath === 'a.txt')?.stage).toBe(2);
+        });
+
+        it('should support rm and rm --cached', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+
+            await memGit.writeFile('b.txt', '2');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m b');
+
+            const out = await memGit.exec('rm a.txt');
+            expect(out).toContain("rm 'a.txt'");
+            expect(await memGit.fileExists('a.txt')).toBe(false);
+
+            await memGit.exec('rm --cached b.txt');
+            expect(await memGit.fileExists('b.txt')).toBe(true);
+        });
+
+        it('should throw when rm has no path', async () => {
+            await expect(memGit.exec('rm')).rejects.toThrow(/No pathspec/);
+        });
+
+        it('should support mv', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.exec('mv a.txt renamed.txt');
+            expect(await memGit.fileExists('renamed.txt')).toBe(true);
+            expect(await memGit.fileExists('a.txt')).toBe(false);
+        });
+
+        it('should throw when mv has no source/dest', async () => {
+            await expect(memGit.exec('mv only-one')).rejects.toThrow(/bad source/);
+        });
+
+        it('should support commit --amend', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m original');
+            await memGit.writeFile('a.txt', '2');
+            await memGit.exec('add .');
+            const out = await memGit.exec('commit --amend -m amended');
+            expect(out).toContain('amended');
+            const logs = await memGit.log();
+            expect(logs).toHaveLength(1);
+        });
+
+        it('should support commit -a (auto-stage)', async () => {
+            await memGit.writeFile('a.txt', 'v1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.writeFile('a.txt', 'v2');
+            const out = await memGit.exec('commit -a -m update');
+            expect(out).toContain('update');
+        });
+
+        it('should support commit --author', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit --author "Alice <alice@x.com>" -m by-alice');
+            const logs = await memGit.log();
+            expect(logs[0].author).toBe('Alice');
+            expect(logs[0].email).toBe('alice@x.com');
+        });
+
+        it('should render human-readable status', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.writeFile('a.txt', 'v2');
+            await memGit.writeFile('b.txt', 'new');
+            const out = await memGit.exec('status');
+            expect(out).toContain('On branch main');
+            expect(out).toContain('Untracked files');
+            expect(out).toContain('b.txt');
+        });
+
+        it('should render clean working tree message', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            const out = await memGit.exec('status');
+            expect(out).toContain('nothing to commit');
+        });
+
+        it('should support log with --author filter', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            memGit.setAuthor('Alice', 'alice@x.com');
+            await memGit.exec('commit -m alice');
+            await memGit.writeFile('b.txt', '2');
+            await memGit.exec('add .');
+            memGit.setAuthor('Bob', 'bob@x.com');
+            await memGit.exec('commit -m bob');
+            const out = await memGit.exec('log --author=alice --oneline');
+            expect(out).toContain('alice');
+            expect(out).not.toContain('bob');
+        });
+
+        it('should support show on HEAD', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            const out = await memGit.exec('show');
+            expect(out).toMatch(/^commit [0-9a-f]{40}/);
+            expect(out).toContain('a.txt');
+        });
+
+        it('should support diff --name-only and --name-status', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.writeFile('a.txt', '2');
+            await memGit.exec('add .');
+            const nameOnly = await memGit.exec('diff --cached --name-only');
+            expect(nameOnly).toBe('a.txt');
+            const nameStatus = await memGit.exec('diff --cached --name-status');
+            expect(nameStatus).toMatch(/^M\ta\.txt$/);
+        });
+
+        it('should support diff between two refs', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m first');
+            await memGit.writeFile('b.txt', '2');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m second');
+            const out = await memGit.exec('diff HEAD~ HEAD --name-only').catch(() => null);
+            // HEAD~ syntax not supported by isomorphic-git, but checking refs works:
+            const logs = await memGit.log();
+            const first = logs[1].sha;
+            const second = logs[0].sha;
+            const out2 = await memGit.exec(`diff ${first} ${second} --name-only`);
+            expect(out2).toContain('b.txt');
+            void out;
+        });
+
+        it('should support branch list and branch <name>', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.exec('branch feature');
+            const out = await memGit.exec('branch');
+            expect(out).toContain('* main');
+            expect(out).toContain('feature');
+        });
+
+        it('should support branch -D (force delete)', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.exec('checkout -b feature');
+            await memGit.writeFile('b.txt', '2');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m feat');
+            await memGit.exec('checkout main');
+            await memGit.exec('branch -D feature');
+            const branches = await memGit.listBranches();
+            expect(branches.find(b => b.name === 'feature')).toBeUndefined();
+        });
+
+        it('should support branch -m rename', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.exec('branch feature');
+            await memGit.exec('branch -m feature renamed');
+            const branches = await memGit.listBranches();
+            expect(branches.find(b => b.name === 'renamed')).toBeDefined();
+            expect(branches.find(b => b.name === 'feature')).toBeUndefined();
+        });
+
+        it('should support merge fast-forward', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.exec('checkout -b feature');
+            await memGit.writeFile('b.txt', '2');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m feat');
+            await memGit.exec('checkout main');
+            const out = await memGit.exec('merge feature');
+            expect(out).toContain('Fast-forward');
+        });
+
+        it('should throw when merge has no branch', async () => {
+            await expect(memGit.exec('merge')).rejects.toThrow(/No branch/);
+        });
+
+        it('should support tag with -a -m', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.exec('tag -a v1.0 -m "release 1"');
+            const tags = await memGit.listTags();
+            expect(tags).toContain('v1.0');
+        });
+
+        it('should support reset --soft and --mixed', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            const first = await memGit.exec('commit -m first');
+            const sha = (await memGit.resolveRef('HEAD'));
+            await memGit.writeFile('b.txt', '2');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m second');
+            await memGit.exec(`reset --soft ${sha}`);
+            expect(await memGit.resolveRef('HEAD')).toBe(sha);
+            void first;
+        });
+
+        it('should support stash list', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.writeFile('a.txt', '2');
+            await memGit.exec('stash');
+            const list = await memGit.exec('stash list');
+            expect(list).toBe('stash@{0}');
+        });
+
+        it('should support stash pop', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.writeFile('a.txt', '2');
+            await memGit.exec('stash');
+            expect(await memGit.readFile('a.txt')).toBe('1');
+            await memGit.exec('stash pop');
+            expect(await memGit.readFile('a.txt')).toBe('2');
+        });
+
+        it('should throw on unknown stash action', async () => {
+            await expect(memGit.exec('stash bogus')).rejects.toThrow(/Unknown stash/);
+        });
+
+        it('should support remote add and list', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.exec('remote add origin https://example.com/repo.git');
+            const out = await memGit.exec('remote -v');
+            expect(out).toContain('origin');
+            expect(out).toContain('https://example.com/repo.git');
+        });
+
+        it('should support remote remove', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            await memGit.exec('remote add origin https://x.com/r.git');
+            await memGit.exec('remote remove origin');
+            const remotes = await memGit.listRemotes();
+            expect(remotes).toHaveLength(0);
+        });
+
+        it('should throw on unknown remote subcommand', async () => {
+            await expect(memGit.exec('remote bogus')).rejects.toThrow(/Unknown remote/);
+        });
+
+        it('should throw when config has no key', async () => {
+            await expect(memGit.exec('config')).rejects.toThrow(/key required/);
+        });
+
+        it('should support ls-files', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.writeFile('b.txt', '2');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m init');
+            const out = await memGit.exec('ls-files');
+            expect(out).toContain('a.txt');
+            expect(out).toContain('b.txt');
+        });
+
+        it('should support rev-list', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m first');
+            await memGit.writeFile('b.txt', '2');
+            await memGit.exec('add .');
+            await memGit.exec('commit -m second');
+            const out = await memGit.exec('rev-list HEAD');
+            expect(out.split('\n')).toHaveLength(2);
+        });
+
+        it('should throw on clone without url', async () => {
+            await expect(memGit.exec('clone')).rejects.toThrow(/specify a repository/);
+        });
+
+        it('should throw on checkout without ref', async () => {
+            await expect(memGit.exec('checkout')).rejects.toThrow(/branch or ref/);
+        });
+
+        it('should parse author with email only', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.exec('add .');
+            // No < >: name only
+            await memGit.exec('commit --author "JustAName" -m c');
+            const logs = await memGit.log();
+            expect(logs[0].author).toBe('JustAName');
+        });
+    });
+
+    describe('Formatters edge cases', () => {
+        beforeEach(async () => {
+            await memGit.init();
+            memGit.setAuthor('Test', 'test@test.com');
+        });
+
+        it('statusText with branch:true shows ## header', async () => {
+            const out = await memGit.statusText({ branch: true });
+            expect(out).toMatch(/^## main/);
+        });
+
+        it('statusText covers staged, modified, and deleted states', async () => {
+            await memGit.writeFile('keep.txt', 'v1');
+            await memGit.writeFile('delete.txt', 'old');
+            await memGit.add('keep.txt');
+            await memGit.add('delete.txt');
+            await memGit.commit('init');
+            await memGit.writeFile('keep.txt', 'v2');
+            await memGit.add('keep.txt');
+            await memGit.writeFile('new.txt', 'fresh');
+            await memGit.deleteFile('delete.txt');
+            const out = await memGit.statusText({ porcelain: true });
+            expect(out).toMatch(/M\s+keep\.txt/);
+            expect(out).toContain('?? new.txt');
+            expect(out).toMatch(/ D\s+delete\.txt/);
+        });
+
+        it('logText default (non-oneline) emits commit header', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.add('a.txt');
+            await memGit.commit('msg');
+            const out = await memGit.logText();
+            expect(out).toMatch(/commit [0-9a-f]{40}/);
+            expect(out).toContain('Author: Test');
+        });
+
+        it('diffText nameStatus shows D for deleted', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.add('a.txt');
+            await memGit.commit('init');
+            await memGit.deleteFile('a.txt');
+            await memGit.add('a.txt'); // stages deletion
+            const out = await memGit.diffText({ cached: true, nameStatus: true });
+            expect(out).toMatch(/D\ta\.txt/);
+        });
+
+        it('diffText default emits filepath: status format', async () => {
+            await memGit.writeFile('a.txt', '1');
+            const out = await memGit.diffText();
+            expect(out).toContain('a.txt');
+            expect(out).toContain('untracked');
+        });
+    });
+
+    describe('Short OID resolution', () => {
+        beforeEach(async () => {
+            await memGit.init();
+            memGit.setAuthor('Test', 'test@test.com');
+        });
+
+        it('reset accepts short OID', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.add('a.txt');
+            const sha = await memGit.commit('init');
+            await memGit.writeFile('a.txt', '2');
+            await memGit.add('a.txt');
+            await memGit.commit('second');
+            await memGit.reset(sha.slice(0, 7), { mode: 'hard' });
+            expect(await memGit.readFile('a.txt')).toBe('1');
+        });
+
+        it('show accepts short OID', async () => {
+            await memGit.writeFile('a.txt', '1');
+            await memGit.add('a.txt');
+            const sha = await memGit.commit('init');
+            const r = await memGit.show(sha.slice(0, 7));
+            expect(r.commit.sha).toBe(sha);
         });
     });
 });

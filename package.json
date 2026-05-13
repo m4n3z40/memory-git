@@ -1,7 +1,7 @@
 {
   "name": "memory-git",
-  "version": "2.2.0",
-  "description": "In-memory Git implementation with disk flush support. All git operations run in memory, minimizing IO, and sync to disk only when needed.",
+  "version": "3.0.0",
+  "description": "In-memory Git for AI agents, slow filesystems (EFS/NFS), and test harnesses. Bash-like exec() dispatcher, no subprocess, isolated per-instance volumes, .gitignore-aware loading, explicit flush.",
   "main": "dist/index.js",
   "exports": {
     ".": {
@@ -37,7 +37,16 @@
     "git-in-memory",
     "flush",
     "non-blocking",
-    "typescript"
+    "typescript",
+    "ai-agents",
+    "agent",
+    "llm",
+    "claude",
+    "git-cli",
+    "exec",
+    "gitignore",
+    "efs",
+    "nfs"
   ],
   "author": "",
   "license": "MIT",
@@ -54,11 +63,15 @@
   },
   "packageManager": "pnpm@11.1.1",
   "dependencies": {
+    "ignore": "^7.0.5",
     "isomorphic-git": "^1.37.6",
-    "memfs": "^4.57.2"
+    "memfs": "^4.57.2",
+    "mri": "^1.2.0",
+    "shell-quote": "^1.8.3"
   },
   "devDependencies": {
     "@types/node": "^25.7.0",
+    "@types/shell-quote": "^1.7.5",
     "@vitest/coverage-v8": "4.1.6",
     "typescript": "^6.0.3",
     "vitest": "^4.1.6"

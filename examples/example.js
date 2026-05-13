@@ -1,292 +1,223 @@
 const path = require('path');
+const fs = require('fs').promises;
 const { MemoryGit } = require('..');
 
 const OUTPUT_REPO = path.join(__dirname, 'output-repo');
 
+const hr = (label = '') => {
+    const line = '='.repeat(70);
+    console.log('\n' + line);
+    if (label) console.log(`  ${label}`);
+    if (label) console.log(line);
+};
+
 /**
- * MemoryGit usage example
- * Demonstrates in-memory git operations with final flush to disk
+ * Demo 1: Agent-style workflow using exec()
+ *
+ * This is what the bash-like exec() dispatcher is for. An AI agent (or any
+ * script that already speaks git CLI) can issue the same command strings it
+ * would type in a terminal — no parser, no subprocess, no disk side effects
+ * until flush().
  */
-async function main() {
-    console.log('='.repeat(60));
-    console.log('MemoryGit - In-Memory Git Demonstration');
-    console.log('='.repeat(60));
-    
-    const memGit = new MemoryGit('demo-fs');
-    
-    // Set the author for commits
-    memGit.setAuthor('Developer', 'dev@example.com');
-    
-    try {
-        // 1. Initialize a new repository in memory
-        console.log('\n📁 Initializing repository in memory...');
-        await memGit.init();
-        
-        // 2. Create some files
-        console.log('\n✏️  Creating files...');
-        
-        await memGit.writeFile('README.md', `# My Project
+async function agentWorkflow() {
+    hr('Demo 1: Agent workflow via exec()');
 
-This is a MemoryGit demonstration project.
+    const mg = new MemoryGit('agent-session');
+    await mg.exec('git init -b main');
+    await mg.exec('git config user.name "Agent Smith"');
+    await mg.exec('git config user.email "agent@example.com"');
 
-## Description
+    // The agent writes some files (the writeFile/readFile API exists because
+    // the in-memory FS isn't reachable through bash redirection)
+    await mg.writeFile('README.md', '# Agent Project\n\nDraft.\n');
+    await mg.writeFile('src/index.js', 'console.log("v1");\n');
+    await mg.writeFile('package.json', JSON.stringify({ name: 'agent-project', version: '0.0.1' }, null, 2));
 
-All operations are done in memory for maximum performance.
-`);
-        
-        await memGit.writeFile('src/index.js', `// Application entry point
-console.log('Hello, MemoryGit!');
+    // Everything else looks exactly like a bash session
+    console.log('\n$ git status --short');
+    console.log(await mg.exec('git status --short'));
 
-module.exports = { version: '1.0.0' };
-`);
-        
-        await memGit.writeFile('src/utils/helper.js', `// Utility functions
-function formatDate(date) {
-    return date.toISOString();
+    console.log('\n$ git add .');
+    await mg.exec('git add .');
+
+    console.log('\n$ git commit -m "feat: initial scaffold"');
+    console.log(await mg.exec('git commit -m "feat: initial scaffold"'));
+
+    // Branch, change, commit
+    console.log('\n$ git checkout -b feat/logger');
+    console.log(await mg.exec('git checkout -b feat/logger'));
+
+    await mg.writeFile('src/index.js', 'const log = (m) => console.log("[LOG]", m);\nlog("v2");\n');
+
+    console.log('\n$ git add . && git commit -m "feat: add logger"');
+    await mg.exec('git add .');
+    console.log(await mg.exec('git commit -m "feat: add logger"'));
+
+    // Merge back
+    console.log('\n$ git checkout main');
+    await mg.exec('git checkout main');
+    console.log('\n$ git merge feat/logger');
+    console.log(await mg.exec('git merge feat/logger'));
+
+    // Inspect
+    console.log('\n$ git log --oneline');
+    console.log(await mg.exec('git log --oneline'));
+
+    console.log('\n$ git branch');
+    console.log(await mg.exec('git branch'));
+
+    // Audit trail — every method call (including via exec) is recorded
+    const stats = mg.getOperationsStats();
+    console.log(`\n📋 Operations recorded: ${stats.total} (${stats.successful} ok, ${stats.failed} failed)`);
+    console.log('   Top operations:');
+    Object.entries(stats.byOperation)
+        .sort((a, b) => b[1].total - a[1].total)
+        .slice(0, 5)
+        .forEach(([op, d]) => console.log(`     ${op}: ${d.total}`));
 }
 
-function generateId() {
-    return Math.random().toString(36).substr(2, 9);
+/**
+ * Demo 2: Programmatic API for when you need structured data
+ *
+ * exec() returns formatted strings (like the real CLI). When you need typed
+ * results — SHA strings, commit objects, file lists — call the typed methods
+ * directly. They share the same in-memory state.
+ */
+async function programmaticWorkflow() {
+    hr('Demo 2: Programmatic API (typed returns)');
+
+    const mg = new MemoryGit('typed-demo');
+    mg.setAuthor('Developer', 'dev@example.com');
+    await mg.init();
+
+    await mg.writeFile('a.txt', 'first');
+    await mg.add('a.txt');
+    const sha1 = await mg.commit('first');
+
+    await mg.writeFile('a.txt', 'second');
+    await mg.writeFile('b.txt', 'new');
+    await mg.add('.');
+    const sha2 = await mg.commit('second');
+
+    console.log(`\n  sha1 = ${sha1}`);
+    console.log(`  sha2 = ${sha2}`);
+
+    // show() returns structured commit + changed files
+    const show = await mg.show(sha2);
+    console.log(`\n  show(${sha2.slice(0, 7)}):`);
+    console.log(`    message: ${show.commit.message.trim()}`);
+    console.log(`    changes: ${show.changes.map(c => `${c.status} ${c.filepath}`).join(', ')}`);
+
+    // diff between two refs
+    const diff = await mg.diff({ fromRef: sha1, toRef: sha2 });
+    console.log(`\n  diff(${sha1.slice(0, 7)} → ${sha2.slice(0, 7)}):`);
+    diff.forEach(d => console.log(`    ${d.status} ${d.filepath}`));
+
+    // amend the last commit (note: the new sha differs)
+    await mg.writeFile('a.txt', 'second (fixed)');
+    await mg.add('a.txt');
+    const amended = await mg.commit('second', { amend: true });
+    console.log(`\n  amended: ${sha2.slice(0, 7)} → ${amended.slice(0, 7)}`);
+
+    // rev-list with options
+    const all = await mg.revList({ all: true, reverse: true });
+    console.log(`\n  rev-list (reverse): ${all.map(s => s.slice(0, 7)).join(', ')}`);
 }
 
-module.exports = { formatDate, generateId };
-`);
-        
-        await memGit.writeFile('package.json', JSON.stringify({
-            name: 'demo-project',
-            version: '1.0.0',
-            main: 'src/index.js'
-        }, null, 2));
-        
-        // 3. Check status
-        console.log('\n📊 Repository status:');
-        const status1 = await memGit.status();
-        status1.forEach(f => console.log(`   ${f.status}: ${f.filepath}`));
-        
-        // 4. Add and commit
-        console.log('\n📦 Adding files to staging...');
-        await memGit.add('.');
-        
-        console.log('\n✅ Creating initial commit...');
-        const commit1 = await memGit.commit('feat: initial commit with base project structure');
-        console.log(`   Commit created: ${commit1.slice(0, 7)}`);
-        
-        // 5. Create a new branch
-        console.log('\n🌿 Creating branch "feature/new-feature"...');
-        await memGit.createBranch('feature/new-feature');
-        await memGit.checkout('feature/new-feature');
-        
-        const currentBranch = await memGit.currentBranch();
-        console.log(`   Current branch: ${currentBranch}`);
-        
-        // 6. Make changes in the new branch
-        console.log('\n✏️  Adding new feature...');
-        await memGit.writeFile('src/feature.js', `// New feature
-class Feature {
-    constructor(name) {
-        this.name = name;
+/**
+ * Demo 3: Slow-storage pattern (EFS / NFS / network mounts)
+ *
+ * The pain point: .git/objects is thousands of tiny files. Every git op on
+ * EFS becomes a torrent of high-latency round-trips. MemoryGit reads the
+ * working tree once, does all git work in RAM, and only writes back the
+ * files you care about.
+ */
+async function slowFsPattern() {
+    hr('Demo 3: Load → work in memory → flush (slow-storage pattern)');
+
+    // Simulate a repo that lives on slow storage by first creating one,
+    // then loading it (which is the one slow operation we accept).
+    await fs.rm(OUTPUT_REPO, { recursive: true, force: true }).catch(() => {});
+    const seed = new MemoryGit('seed');
+    seed.setAuthor('Seed', 'seed@example.com');
+    await seed.init();
+    for (let i = 0; i < 10; i++) {
+        await seed.writeFile(`pkg/${i}.txt`, `payload ${i}\n`.repeat(50));
     }
-    
-    execute() {
-        console.log(\`Executing: \${this.name}\`);
+    await seed.add('.');
+    await seed.commit('seed');
+    await seed.flush(OUTPUT_REPO);
+
+    // The real workload: an agent loads, does many ops, flushes once
+    console.log('\n📂 Loading repository...');
+    const mg = new MemoryGit('slow-fs');
+    mg.setAuthor('Worker', 'worker@example.com');
+    const loaded = await mg.loadFromDisk(OUTPUT_REPO);
+    console.log(`   Loaded ${loaded} files into memory`);
+
+    // Tons of operations — none of these touch the slow disk
+    console.log('\n⚡ Doing 50 in-memory operations (no disk IO):');
+    const t0 = process.hrtime.bigint();
+    for (let i = 0; i < 50; i++) {
+        await mg.exec('git status --porcelain');
+        await mg.exec('git log --oneline -n 1');
     }
+    const elapsed = Number(process.hrtime.bigint() - t0) / 1_000_000;
+    console.log(`   100 status+log calls completed in ${elapsed.toFixed(1)}ms`);
+    console.log(`   On EFS this would have been ~${(100 * 200).toFixed(0)}ms+ minimum`);
+
+    // Make a change and flush — only writes the changed working-tree files
+    await mg.writeFile('CHANGELOG.md', '# Changelog\n\n- new entry\n');
+    await mg.add('CHANGELOG.md');
+    await mg.exec('git commit -m "docs: changelog"');
+
+    console.log('\n💾 Flushing back to disk...');
+    const flushed = await mg.flush();
+    console.log(`   ${flushed} files written`);
 }
 
-module.exports = { Feature };
-`);
-        
-        // Update README
-        const readmeContent = await memGit.readFile('README.md');
-        await memGit.writeFile('README.md', readmeContent + `
-## New Feature
-
-Added Feature class for demonstration.
-`);
-        
-        await memGit.add('.');
-        const commit2 = await memGit.commit('feat: add Feature class');
-        console.log(`   Commit created: ${commit2.slice(0, 7)}`);
-        
-        // 7. Go back to main and merge
-        console.log('\n🔀 Going back to main and merging...');
-        await memGit.checkout('main');
-        const mergeResult = await memGit.merge('feature/new-feature');
-        console.log(`   Merge completed! Result: ${mergeResult.oid ? mergeResult.oid.slice(0, 7) : 'fast-forward'}`);
-        
-        // 8. List branches
-        console.log('\n🌲 Existing branches:');
-        const branches = await memGit.listBranches();
-        branches.forEach(b => console.log(`   ${b.current ? '* ' : '  '}${b.name}`));
-        
-        // 9. Show commit log
-        console.log('\n📜 Commit history:');
-        const logs = await memGit.log(5);
-        logs.forEach(log => {
-            console.log(`   ${log.sha.slice(0, 7)} - ${log.message.split('\n')[0]} (${log.author})`);
-        });
-        
-        // 10. List files
-        console.log('\n📂 Files in repository:');
-        const files = await memGit.listFiles();
-        files.forEach(f => console.log(`   ${f}`));
-        
-        // 11. Show operation statistics
-        console.log('\n📈 In-memory operation statistics:');
-        const stats = memGit.getOperationsStats();
-        console.log(`   Total operations: ${stats.total}`);
-        console.log(`   Successful: ${stats.successful}`);
-        console.log(`   Failed: ${stats.failed}`);
-        console.log('\n   By operation type:');
-        Object.entries(stats.byOperation).forEach(([op, data]) => {
-            console.log(`     ${op}: ${data.total} (${data.successful} ok, ${data.failed} failed)`);
-        });
-        
-        // 12. Show memory usage
-        console.log('\n💾 Memory usage:');
-        const memUsage = memGit.getMemoryUsage();
-        console.log(`   Files in memory: ${memUsage.files}`);
-        console.log(`   Estimated size: ${memUsage.estimatedSizeMB} MB`);
-        console.log(`   Logged operations: ${memUsage.operationsLogged}`);
-        
-        // 13. Flush to disk
-        console.log('\n💾 Saving repository to disk...');
-        const filesFlushed = await memGit.flush(OUTPUT_REPO);
-        console.log(`   Repository saved to: ${OUTPUT_REPO}`);
-        console.log(`   Files written: ${filesFlushed}`);
-        
-        // 14. Show complete operation log (last 10)
-        console.log('\n📋 Complete operation log (last 10):');
-        const operationsLog = memGit.getOperationsLog();
-        operationsLog.slice(-10).forEach(op => {
-            const status = op.success ? '✓' : '✗';
-            console.log(`   [${op.timestamp}] ${status} ${op.operation}`);
-        });
-        
-        console.log('\n' + '='.repeat(60));
-        console.log('Demonstration completed!');
-        console.log('Zero IO operations during git operations.');
-        console.log('All disk writes were done only in flush().');
-        console.log('='.repeat(60));
-        
-    } catch (error) {
-        console.error('\n❌ Error:', error.message);
-        console.error(error.stack);
-        console.log('\n📋 Operation log up to error:');
-        memGit.getOperationsLog().forEach(op => {
-            console.log(`   [${op.timestamp}] ${op.success ? '✓' : '✗'} ${op.operation}`);
-            if (op.error) console.log(`      Error: ${op.error}`);
-        });
-    }
-}
-
-// Example of loading existing repository
-async function loadExistingRepo() {
-    console.log('\n' + '='.repeat(60));
-    console.log('Example: Loading existing repository');
-    console.log('='.repeat(60));
-    
-    const memGit = new MemoryGit('load-demo');
-    memGit.setAuthor('Developer', 'dev@example.com');
-    
-    try {
-        // Load an existing repository from disk
-        console.log('\n📂 Loading repository from disk...');
-        const filesLoaded = await memGit.loadFromDisk(OUTPUT_REPO);
-        console.log(`   Files loaded: ${filesLoaded}`);
-        
-        // Make modifications in memory
-        console.log('\n✏️  Modifying files in memory...');
-        await memGit.writeFile('CHANGELOG.md', `# Changelog
-
-## [1.1.0] - ${new Date().toISOString().split('T')[0]}
-- Added changelog
-- General improvements
-`);
-        
-        await memGit.add('CHANGELOG.md');
-        await memGit.commit('docs: add CHANGELOG.md');
-        
-        // Show status
-        const logs = await memGit.log(3);
-        console.log('\n📜 Latest commits:');
-        logs.forEach(log => {
-            console.log(`   ${log.sha.slice(0, 7)} - ${log.message.split('\n')[0]}`);
-        });
-        
-        // Show repo info
-        console.log('\n📊 Repository information:');
-        const info = await memGit.getRepoInfo();
-        console.log(`   Current branch: ${info.currentBranch}`);
-        console.log(`   Total commits: ${info.commits}`);
-        console.log(`   Total files: ${info.fileCount}`);
-        
-        // Save back
-        console.log('\n💾 Saving changes...');
-        await memGit.flush();
-        
-        console.log('\n✅ Changes saved successfully!');
-        
-        // Export operation log (async)
-        console.log('\n📄 Exporting operation log to file...');
-        const logJson = memGit.exportOperationsLog();
-        const logPath = path.join(OUTPUT_REPO, 'operations-log.json');
-        await require('fs').promises.writeFile(logPath, logJson);
-        console.log(`   Log exported to: ${logPath}`);
-        
-    } catch (error) {
-        console.error('Error:', error.message);
-        console.error(error.stack);
-    }
-}
-
-// Stash demonstration
+/**
+ * Demo 4: Stash via exec()
+ */
 async function stashDemo() {
-    console.log('\n' + '='.repeat(60));
-    console.log('Example: Stash Demonstration');
-    console.log('='.repeat(60));
-    
-    const memGit = new MemoryGit('stash-demo');
-    memGit.setAuthor('Developer', 'dev@example.com');
-    
-    try {
-        await memGit.init();
-        
-        // Create initial file
-        await memGit.writeFile('main.js', 'console.log("v1");');
-        await memGit.add('.');
-        await memGit.commit('Initial commit');
-        
-        // Make modifications
-        console.log('\n✏️  Modifying file...');
-        await memGit.writeFile('main.js', 'console.log("v2 - work in progress");');
-        
-        const contentBefore = await memGit.readFile('main.js');
-        console.log(`   Current content: ${contentBefore.trim()}`);
-        
-        // Save to stash
-        console.log('\n📦 Saving to stash...');
-        const stashedCount = await memGit.stash();
-        console.log(`   ${stashedCount} file(s) saved to stash`);
-        
-        const contentAfterStash = await memGit.readFile('main.js');
-        console.log(`   Content after stash: ${contentAfterStash.trim()}`);
-        
-        // Restore from stash
-        console.log('\n📤 Restoring from stash...');
-        await memGit.stashPop();
-        
-        const contentAfterPop = await memGit.readFile('main.js');
-        console.log(`   Restored content: ${contentAfterPop.trim()}`);
-        
-        console.log('\n✅ Stash working correctly!');
-        
-    } catch (error) {
-        console.error('Error:', error.message);
-    }
+    hr('Demo 4: Stash');
+
+    const mg = new MemoryGit('stash-demo');
+    mg.setAuthor('Developer', 'dev@example.com');
+    await mg.init();
+
+    await mg.writeFile('main.js', 'console.log("v1");');
+    await mg.add('.');
+    await mg.commit('init');
+
+    await mg.writeFile('main.js', 'console.log("v2 wip");');
+    console.log(`\n  workdir before stash: ${(await mg.readFile('main.js')).trim()}`);
+
+    console.log(`\n$ git stash`);
+    console.log('  ' + await mg.exec('git stash'));
+    console.log(`  workdir after stash: ${(await mg.readFile('main.js')).trim()}`);
+
+    console.log(`\n$ git stash list`);
+    console.log('  ' + await mg.exec('git stash list'));
+
+    console.log(`\n$ git stash pop`);
+    console.log('  ' + await mg.exec('git stash pop'));
+    console.log(`  workdir after pop: ${(await mg.readFile('main.js')).trim()}`);
 }
 
-// Run demonstrations
-main()
-    .then(() => loadExistingRepo())
-    .then(() => stashDemo())
-    .catch(console.error);
+(async () => {
+    try {
+        await agentWorkflow();
+        await programmaticWorkflow();
+        await slowFsPattern();
+        await stashDemo();
+
+        hr('Done');
+        console.log('All git operations ran in memory. Disk was touched only in flush().');
+        console.log('Inspect ' + OUTPUT_REPO + ' for the flushed output.');
+    } catch (err) {
+        console.error('\n❌ Error:', err.message);
+        console.error(err.stack);
+        process.exit(1);
+    }
+})();
