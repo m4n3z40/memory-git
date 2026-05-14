@@ -8,6 +8,13 @@ import mri from 'mri';
 import ignore from 'ignore';
 
 import { OperationLog } from './operation-log.js';
+import {
+    realPathExists,
+    collectGitignorePatterns,
+    copyDiskToMemory,
+    copyMemoryToDisk,
+    listFilesRecursive,
+} from './disk-sync.js';
 
 type MemFs = ReturnType<typeof createFsFromVolume>;
 
@@ -223,19 +230,6 @@ export class MemoryGit {
     }
 
     /**
-     * Checks if a path exists on real disk (async)
-     * @private
-     */
-    private async _realPathExists(filepath: string): Promise<boolean> {
-        try {
-            await fsRealAsync.access(filepath);
-            return true;
-        } catch {
-            return false;
-        }
-    }
-
-    /**
      * Sets the author for commits
      * @param name - Author name
      * @param email - Author email
@@ -307,19 +301,16 @@ export class MemoryGit {
             matcher.add(explicitIgnore);
 
             if (respectGitignore) {
-                const patterns = await this._collectGitignorePatterns(this.realDir, nestedGitignore);
+                const patterns = await collectGitignorePatterns(this.realDir, nestedGitignore);
                 if (patterns.length > 0) matcher.add(patterns);
             }
 
-            // Create base directory in memory
             this.fs.mkdirSync(this.dir, { recursive: true });
-
-            // Copy recursively from disk to memory (async)
-            const fileCount = await this._copyToMemoryAsync(this.realDir, this.dir, matcher, '');
+            const fileCount = await copyDiskToMemory(this.fs, this.realDir, this.dir, matcher, '');
 
             // After load, every working-tree file is unsynced with the (likely empty) index.
             // Seed the dirty set so `add('.')` can pick them all up without rescanning.
-            for (const f of this._listFilesRecursive(this.dir)) {
+            for (const f of listFilesRecursive(this.fs, this.dir)) {
                 this._dirtyFiles.add(f);
             }
 
@@ -335,107 +326,6 @@ export class MemoryGit {
             this._logOperation('loadFromDisk', { sourcePath }, null, error as Error);
             throw error;
         }
-    }
-
-    /**
-     * Walks the source tree and collects all .gitignore patterns (with prefixes for nested files).
-     * @private
-     */
-    private async _collectGitignorePatterns(root: string, nested: boolean): Promise<string[]> {
-        const patterns: string[] = [];
-
-        const readGitignore = async (filePath: string, prefix: string) => {
-            try {
-                const content = await fsRealAsync.readFile(filePath, 'utf8');
-                for (const raw of content.split(/\r?\n/)) {
-                    const line = raw.trim();
-                    if (!line || line.startsWith('#')) continue;
-                    if (!prefix) {
-                        patterns.push(line);
-                    } else {
-                        // Translate a nested-gitignore pattern into a root-relative pattern.
-                        // Handle leading `!` (negation) and `/` (anchored) correctly.
-                        const negated = line.startsWith('!');
-                        const body = negated ? line.slice(1) : line;
-                        const anchored = body.startsWith('/');
-                        const cleaned = anchored ? body.slice(1) : body;
-                        const prefixed = anchored
-                            ? `${prefix}/${cleaned}`
-                            : `${prefix}/**/${cleaned}`;
-                        patterns.push(negated ? `!${prefixed}` : prefixed);
-                    }
-                }
-            } catch {
-                // No .gitignore at this location
-            }
-        };
-
-        await readGitignore(pathNode.join(root, '.gitignore'), '');
-
-        if (nested) {
-            const walk = async (dir: string, rel: string): Promise<void> => {
-                let entries: import('fs').Dirent[];
-                try {
-                    entries = await fsRealAsync.readdir(dir, { withFileTypes: true });
-                } catch {
-                    return;
-                }
-                await Promise.all(entries.map(async entry => {
-                    if (entry.name === '.git' || entry.name === 'node_modules') return;
-                    const full = pathNode.join(dir, entry.name);
-                    const relPath = rel ? pathNode.posix.join(rel, entry.name) : entry.name;
-                    if (entry.isDirectory()) {
-                        await readGitignore(pathNode.join(full, '.gitignore'), relPath);
-                        await walk(full, relPath);
-                    }
-                }));
-            };
-            await walk(root, '');
-        }
-
-        return patterns;
-    }
-
-    /**
-     * Copies files from real disk to memory filesystem (async)
-     * @private
-     */
-    private async _copyToMemoryAsync(
-        realPath: string,
-        memoryPath: string,
-        matcher: ReturnType<typeof ignore>,
-        relPath: string
-    ): Promise<number> {
-        const entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
-
-        const promises = entries.map(async (entry) => {
-            const entryRel = relPath ? pathNode.posix.join(relPath, entry.name) : entry.name;
-
-            // Always load the repo's own .git/ — that's the git database we need.
-            // The exception covers the .git directory itself AND anything beneath it.
-            const insideGit = entryRel === '.git' || entryRel.startsWith('.git/');
-            if (!insideGit) {
-                // ignore() requires a trailing slash on directories to apply directory-only rules
-                const probe = entry.isDirectory() ? `${entryRel}/` : entryRel;
-                if (matcher.ignores(probe)) return 0;
-            }
-
-            const realEntryPath = pathNode.join(realPath, entry.name);
-            const memoryEntryPath = pathNode.posix.join(memoryPath, entry.name);
-
-            if (entry.isDirectory()) {
-                this.fs.mkdirSync(memoryEntryPath, { recursive: true });
-                return await this._copyToMemoryAsync(realEntryPath, memoryEntryPath, matcher, entryRel);
-            } else if (entry.isFile()) {
-                const content = await fsRealAsync.readFile(realEntryPath);
-                this.fs.writeFileSync(memoryEntryPath, content);
-                return 1;
-            }
-            return 0;
-        });
-
-        const results = await Promise.all(promises);
-        return results.reduce((acc, val) => acc + val, 0);
     }
 
     /**
@@ -1438,61 +1328,25 @@ export class MemoryGit {
     async flush(targetPath: string | null = null, options: FlushOptions = {}): Promise<number> {
         try {
             const destination = targetPath ? pathNode.resolve(targetPath) : this.realDir;
-            
             if (!destination) {
                 throw new Error('No destination path specified and repository was not loaded from disk');
             }
-            
-            // Create destination directory if it doesn't exist (async)
-            const destinationExists = await this._realPathExists(destination);
-            if (!destinationExists) {
+
+            if (!(await realPathExists(destination))) {
                 await fsRealAsync.mkdir(destination, { recursive: true });
             }
-            
-            // Copy recursively from memory to disk (async)
-            const fileCount = await this._copyToDiskAsync(this.dir, destination);
-            
-            this._logOperation('flush', { targetPath: destination, options }, { 
+
+            const fileCount = await copyMemoryToDisk(this.fs, this.dir, destination);
+
+            this._logOperation('flush', { targetPath: destination, options }, {
                 success: true,
                 filesFlushed: fileCount
             });
-            
             return fileCount;
         } catch (error) {
             this._logOperation('flush', { targetPath }, null, error as Error);
             throw error;
         }
-    }
-
-    /**
-     * Copies files from memory to disk (async)
-     * @private
-     */
-    private async _copyToDiskAsync(memoryPath: string, realPath: string): Promise<number> {
-        const entries = this.fs.readdirSync(memoryPath) as string[];
-        
-        // Process entries in parallel for better performance
-        const promises = entries.map(async (entry) => {
-            const memoryEntryPath = pathNode.posix.join(memoryPath, entry);
-            const realEntryPath = pathNode.join(realPath, entry);
-            
-            const stat = this.fs.statSync(memoryEntryPath);
-            
-            if (stat.isDirectory()) {
-                const dirExists = await this._realPathExists(realEntryPath);
-                if (!dirExists) {
-                    await fsRealAsync.mkdir(realEntryPath, { recursive: true });
-                }
-                return await this._copyToDiskAsync(memoryEntryPath, realEntryPath);
-            } else {
-                const content = this.fs.readFileSync(memoryEntryPath);
-                await fsRealAsync.writeFile(realEntryPath, content);
-                return 1;
-            }
-        });
-        
-        const results = await Promise.all(promises);
-        return results.reduce((acc, val) => acc + val, 0);
     }
 
     /**
@@ -1504,37 +1358,13 @@ export class MemoryGit {
     async listFiles(dir: string = '', includeGit: boolean = false): Promise<string[]> {
         try {
             const fullPath = pathNode.posix.join(this.dir, dir);
-            const files = this._listFilesRecursive(fullPath, '', includeGit);
+            const files = listFilesRecursive(this.fs, fullPath, '', includeGit);
             this._logOperation('listFiles', { dir }, { success: true, files: files.length });
             return files;
         } catch (error) {
             this._logOperation('listFiles', { dir }, null, error as Error);
             throw error;
         }
-    }
-
-    /**
-     * Lists files recursively
-     * @private
-     */
-    private _listFilesRecursive(dir: string, base: string = '', includeGit: boolean = false): string[] {
-        const files: string[] = [];
-        const entries = this.fs.readdirSync(dir) as string[];
-        
-        for (const entry of entries) {
-            const fullPath = pathNode.posix.join(dir, entry);
-            const relativePath = base ? pathNode.posix.join(base, entry) : entry;
-            const stat = this.fs.statSync(fullPath);
-            
-            if (stat.isDirectory()) {
-                if (entry === '.git' && !includeGit) continue;
-                files.push(...this._listFilesRecursive(fullPath, relativePath, includeGit));
-            } else {
-                files.push(relativePath);
-            }
-        }
-        
-        return files;
     }
 
     /**
@@ -1648,7 +1478,7 @@ export class MemoryGit {
     async stash(): Promise<number> {
         try {
             // Walk workdir + tracked directly to avoid memfs/statusMatrix cache miss
-            const workdirFiles = new Set(this._listFilesRecursive(this.dir));
+            const workdirFiles = new Set(listFilesRecursive(this.fs, this.dir));
             let trackedFiles: string[] = [];
             try {
                 trackedFiles = await git.listFiles({ fs: this.fs, dir: this.dir, ref: 'HEAD' });
