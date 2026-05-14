@@ -4,7 +4,6 @@ import { createFsFromVolume, Volume } from 'memfs';
 import { promises as fsRealAsync } from 'fs';
 import pathNode from 'path';
 import { parse as shellParse } from 'shell-quote';
-import mri from 'mri';
 import ignore from 'ignore';
 
 import { OperationLog } from './operation-log.js';
@@ -15,6 +14,7 @@ import {
     copyMemoryToDisk,
     listFilesRecursive,
 } from './disk-sync.js';
+import { getCommand, type Command } from './commands/index.js';
 
 type MemFs = ReturnType<typeof createFsFromVolume>;
 
@@ -1873,367 +1873,18 @@ export class MemoryGit {
      */
     async exec(cmd: string, options: ExecOptions = {}): Promise<string> {
         this._checkSignal(options.signal);
-        const tokens = shellParse(cmd).filter((t): t is string => typeof t === 'string');
-        if (tokens.length === 0) return '';
-        if (tokens[0] === 'git') tokens.shift();
-        if (tokens.length === 0) return '';
-
-        const sub = tokens.shift()!;
-        const args = tokens;
-        const signal = options.signal;
-
-        switch (sub) {
-            case 'init': {
-                const a = mri(args, { alias: { b: 'initial-branch' }, boolean: ['bare'] });
-                await this.init({
-                    defaultBranch: (a['initial-branch'] as string) || undefined,
-                    bare: !!a.bare
-                });
-                return `Initialized empty Git repository in ${this.dir}/.git/`;
-            }
-            case 'add': {
-                const a = mri(args, { alias: { A: 'all', u: 'update' }, boolean: ['all', 'update'] });
-                const paths = a._;
-                if (a.all || a.update) {
-                    await this.add([], { all: !!a.all, update: !!a.update });
-                } else if (paths.length === 0) {
-                    throw new Error("Nothing specified, nothing added.");
-                } else {
-                    await this.add(paths.map(String));
-                }
-                return '';
-            }
-            case 'rm':
-            case 'remove': {
-                const a = mri(args, { boolean: ['cached', 'r', 'f'] });
-                const file = String(a._[0] ?? '');
-                if (!file) throw new Error('fatal: No pathspec given');
-                await this.remove(file, { cached: !!a.cached });
-                return `rm '${file}'`;
-            }
-            case 'mv': {
-                const a = mri(args, { boolean: ['f'] });
-                const [from, to] = a._.map(String);
-                if (!from || !to) throw new Error('fatal: bad source/destination');
-                await this.rename(from, to, { force: !!a.f });
-                return '';
-            }
-            case 'commit': {
-                const a = mri(args, {
-                    alias: { m: 'message', a: 'all' },
-                    boolean: ['amend', 'allow-empty', 'all'],
-                    string: ['message', 'author', 'date']
-                });
-                const message = String(a.message ?? '');
-                const sha = await this.commit(message, {
-                    amend: !!a.amend,
-                    allowEmpty: !!a['allow-empty'],
-                    all: !!a.all,
-                    date: a.date ? new Date(String(a.date)) : undefined,
-                    author: a.author ? this._parseAuthor(String(a.author)) : undefined
-                });
-                const branch = (await this.currentBranch()) ?? 'HEAD';
-                return `[${branch} ${sha.slice(0, 7)}] ${message.split('\n')[0]}`;
-            }
-            case 'status': {
-                const a = mri(args, {
-                    alias: { s: 'short', b: 'branch' },
-                    boolean: ['short', 'porcelain', 'branch']
-                });
-                if (a.short || a.porcelain) {
-                    return this.statusText({ porcelain: !!a.porcelain, short: !!a.short, branch: !!a.branch });
-                }
-                // Human-readable
-                const matrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
-                const current = (await this.currentBranch()) ?? 'HEAD';
-                const lines = [`On branch ${current}`];
-                const staged: string[] = [];
-                const unstaged: string[] = [];
-                const untracked: string[] = [];
-                for (const [fp, head, workdir, stage] of matrix) {
-                    const h = head as number;
-                    const w = workdir as number;
-                    const s = stage as number;
-                    if (h === 1 && w === 1 && s === 1) continue;
-                    if (h === 0 && s === 0) untracked.push(fp as string);
-                    else if (h !== s) staged.push(fp as string);
-                    if (s !== 0 && s !== w) unstaged.push(fp as string);
-                }
-                if (staged.length === 0 && unstaged.length === 0 && untracked.length === 0) {
-                    lines.push('nothing to commit, working tree clean');
-                } else {
-                    if (staged.length) lines.push('Changes to be committed:', ...staged.map(f => `\tnew/modified:   ${f}`));
-                    if (unstaged.length) lines.push('Changes not staged for commit:', ...unstaged.map(f => `\tmodified:   ${f}`));
-                    if (untracked.length) lines.push('Untracked files:', ...untracked.map(f => `\t${f}`));
-                }
-                return lines.join('\n');
-            }
-            case 'log': {
-                const a = mri(args, {
-                    alias: { n: 'max-count' },
-                    boolean: ['oneline', 'all'],
-                    string: ['author', 'since', 'until']
-                });
-                const ref = a._[0] ? String(a._[0]) : undefined;
-                return this.logText({
-                    depth: a['max-count'] ? Number(a['max-count']) : undefined,
-                    ref,
-                    author: a.author ? String(a.author) : undefined,
-                    since: a.since ? new Date(String(a.since)) : undefined,
-                    until: a.until ? new Date(String(a.until)) : undefined,
-                    oneline: !!a.oneline
-                });
-            }
-            case 'show': {
-                const a = mri(args);
-                const ref = a._[0] ? String(a._[0]) : 'HEAD';
-                const r = await this.show(ref);
-                const lines = [
-                    `commit ${r.commit.sha}`,
-                    `Author: ${r.commit.author} <${r.commit.email}>`,
-                    `Date:   ${new Date(r.commit.timestamp).toString()}`,
-                    '',
-                    `    ${r.commit.message.trim().replace(/\n/g, '\n    ')}`,
-                    '',
-                    ...r.changes.map(c => `${c.status[0].toUpperCase()}\t${c.filepath}`)
-                ];
-                return lines.join('\n');
-            }
-            case 'diff': {
-                const a = mri(args, {
-                    boolean: ['cached', 'staged', 'name-only', 'name-status']
-                });
-                const refs = a._.map(String);
-                return this.diffText({
-                    cached: !!(a.cached || a.staged),
-                    fromRef: refs[0],
-                    toRef: refs[1],
-                    nameOnly: !!a['name-only'],
-                    nameStatus: !!a['name-status']
-                });
-            }
-            case 'branch': {
-                const a = mri(args, {
-                    alias: { d: 'delete', D: 'delete-force', m: 'move' },
-                    string: ['delete', 'delete-force'],
-                    boolean: ['move']
-                });
-                if (a.move) {
-                    const [oldN, newN] = a._.map(String);
-                    if (!oldN || !newN) throw new Error('branch -m requires <old> <new>');
-                    await this.renameBranch(oldN, newN);
-                    return '';
-                }
-                if (a['delete-force']) {
-                    await this.deleteBranch(String(a['delete-force']), { force: true });
-                    return '';
-                }
-                if (a.delete) {
-                    await this.deleteBranch(String(a.delete));
-                    return '';
-                }
-                if (a._.length > 0) {
-                    await this.createBranch(String(a._[0]));
-                    return '';
-                }
-                return this.branchText();
-            }
-            case 'checkout': {
-                const a = mri(args, {
-                    alias: { b: 'create-branch', f: 'force' },
-                    boolean: ['create-branch', 'force']
-                });
-                const positional = a._.map(String);
-                const sep = positional.indexOf('--');
-                const refs = sep >= 0 ? positional.slice(0, sep) : positional;
-                const files = sep >= 0 ? positional.slice(sep + 1) : undefined;
-                const ref = refs[0];
-                if (!ref) throw new Error('fatal: you must specify a branch or ref');
-                await this.checkout(ref, {
-                    createBranch: !!a['create-branch'],
-                    force: !!a.force,
-                    files
-                });
-                return a['create-branch']
-                    ? `Switched to a new branch '${ref}'`
-                    : `Switched to branch '${ref}'`;
-            }
-            case 'merge': {
-                const a = mri(args, {
-                    alias: { m: 'message' },
-                    boolean: ['no-ff', 'ff-only'],
-                    string: ['message']
-                });
-                const branch = String(a._[0] ?? '');
-                if (!branch) throw new Error('fatal: No branch specified');
-                const result = await this.merge(branch, {
-                    noFastForward: !!a['no-ff'],
-                    fastForwardOnly: !!a['ff-only'],
-                    message: a.message ? String(a.message) : undefined
-                });
-                if (result.alreadyMerged) return 'Already up to date.';
-                if (result.fastForward) return `Fast-forward to ${result.oid?.slice(0, 7)}`;
-                return `Merge made by recursive into ${(await this.currentBranch()) ?? 'HEAD'}`;
-            }
-            case 'tag': {
-                const a = mri(args, {
-                    alias: { a: 'annotated', d: 'delete', m: 'message', l: 'list', f: 'force' },
-                    boolean: ['annotated', 'list', 'force'],
-                    string: ['message', 'delete']
-                });
-                if (a.delete) {
-                    await this.deleteTag(String(a.delete));
-                    return `Deleted tag '${a.delete}'`;
-                }
-                if (a.list || a._.length === 0) {
-                    return (await this.listTags()).join('\n');
-                }
-                const [name, ref] = a._.map(String);
-                await this.createTag(name, {
-                    ref: ref || 'HEAD',
-                    annotated: !!a.annotated,
-                    message: a.message ? String(a.message) : undefined,
-                    force: !!a.force
-                });
-                return '';
-            }
-            case 'reset': {
-                const a = mri(args, {
-                    boolean: ['soft', 'mixed', 'hard']
-                });
-                const positional = a._.map(String);
-                const sep = positional.indexOf('--');
-                const refs = sep >= 0 ? positional.slice(0, sep) : positional;
-                const paths = sep >= 0 ? positional.slice(sep + 1) : undefined;
-                const mode: ResetMode = a.hard ? 'hard' : a.soft ? 'soft' : 'mixed';
-                const ref = refs[0] ?? 'HEAD';
-                await this.reset(ref, { mode, paths });
-                return '';
-            }
-            case 'clone': {
-                const a = mri(args, {
-                    alias: { b: 'branch' },
-                    boolean: ['single-branch', 'no-checkout'],
-                    string: ['branch']
-                });
-                const url = String(a._[0] ?? '');
-                if (!url) throw new Error('fatal: You must specify a repository to clone.');
-                await this.clone(url, {
-                    branch: a.branch ? String(a.branch) : undefined,
-                    singleBranch: !!a['single-branch'],
-                    noCheckout: !!a['no-checkout'],
-                    depth: a.depth ? Number(a.depth) : undefined,
-                    signal
-                });
-                return `Cloning into '${this.dir}'...`;
-            }
-            case 'fetch': {
-                const a = mri(args, { boolean: ['prune', 'tags', 'all'] });
-                const remote = a._[0] ? String(a._[0]) : 'origin';
-                await this.fetch({
-                    remote,
-                    prune: !!a.prune,
-                    tags: !!a.tags,
-                    depth: a.depth ? Number(a.depth) : undefined,
-                    signal
-                });
-                return '';
-            }
-            case 'pull': {
-                const a = mri(args, { boolean: ['ff-only', 'ff'] });
-                const [remote, branch] = a._.map(String);
-                await this.pull({
-                    remote: remote || 'origin',
-                    branch: branch || undefined,
-                    fastForwardOnly: !!a['ff-only'],
-                    signal
-                });
-                return '';
-            }
-            case 'push': {
-                const a = mri(args, { alias: { f: 'force' }, boolean: ['force', 'delete'] });
-                const [remote, ref] = a._.map(String);
-                await this.push({
-                    remote: remote || 'origin',
-                    ref: ref || undefined,
-                    force: !!a.force,
-                    delete: !!a.delete,
-                    signal
-                });
-                return '';
-            }
-            case 'remote': {
-                const action = String(args[0] ?? '');
-                if (!action || action === '-v' || action === '--verbose') {
-                    const r = await this.listRemotes();
-                    return r.map(x => `${x.remote}\t${x.url}`).join('\n');
-                }
-                if (action === 'add') {
-                    await this.addRemote(String(args[1] ?? ''), String(args[2] ?? ''));
-                    return '';
-                }
-                if (action === 'remove' || action === 'rm') {
-                    await this.deleteRemote(String(args[1] ?? ''));
-                    return '';
-                }
-                throw new Error(`Unknown remote subcommand: ${action}`);
-            }
-            case 'config': {
-                const a = mri(args);
-                const [key, value] = a._.map(String);
-                if (!key) throw new Error('error: key required');
-                const result = await this.config(key, value || undefined);
-                return result ?? '';
-            }
-            case 'stash': {
-                const action = String(args[0] ?? 'push');
-                if (action === 'push' || !args[0]) {
-                    const n = await this.stash();
-                    return `Saved working directory and index state (${n} files)`;
-                }
-                if (action === 'pop') {
-                    const n = await this.stashPop();
-                    return `Restored ${n} files from stash`;
-                }
-                if (action === 'list') {
-                    const n = this.stashList();
-                    return Array.from({ length: n }, (_, i) => `stash@{${i}}`).join('\n');
-                }
-                throw new Error(`Unknown stash action: ${action}`);
-            }
-            case 'rev-parse': {
-                const a = mri(args, { boolean: ['short', 'abbrev-ref'] });
-                const ref = String(a._[0] ?? 'HEAD');
-                return this.resolveRef(ref, { short: !!a.short, abbrevRef: !!a['abbrev-ref'] });
-            }
-            case 'ls-files': {
-                return (await this.listTrackedFiles()).join('\n');
-            }
-            case 'rev-list': {
-                const a = mri(args, {
-                    boolean: ['all', 'reverse'],
-                    alias: { 'max-count': 'n' }
-                });
-                const ref = a._[0] ? String(a._[0]) : undefined;
-                const oids = await this.revList({
-                    all: !!a.all,
-                    reverse: !!a.reverse,
-                    maxCount: a['max-count'] ? Number(a['max-count']) : undefined,
-                    ref
-                });
-                return oids.join('\n');
-            }
-            default:
-                throw new Error(`memory-git: '${sub}' is not a supported command`);
-        }
+        const { handler, args } = this._dispatch(cmd);
+        if (!handler) return '';
+        return handler.run({ mg: this, signal: options.signal }, args);
     }
 
     /**
      * Streaming variant of {@link exec}. Yields one logical line at a time.
      *
-     * Subcommands that iterate naturally (log, ls-files, rev-list) yield item-by-item;
-     * other subcommands compute the full output, then yield per `\n`. Empty trailing
-     * lines are dropped. The signal is checked before each yield.
+     * Subcommands with a custom `stream` (log, ls-files, rev-list) yield
+     * item-by-item; everything else runs `run()` to completion and yields per
+     * `\n`. A trailing empty line is dropped; blank middle lines are kept.
+     * The signal is checked before each yield.
      *
      * Example:
      *   for await (const line of mg.execStream('git log --oneline')) {
@@ -2243,79 +1894,16 @@ export class MemoryGit {
      */
     async *execStream(cmd: string, options: ExecOptions = {}): AsyncIterable<string> {
         this._checkSignal(options.signal);
-        const tokens = shellParse(cmd).filter((t): t is string => typeof t === 'string');
-        if (tokens.length === 0) return;
-        if (tokens[0] === 'git') tokens.shift();
-        if (tokens.length === 0) return;
-
-        const sub = tokens[0];
-        const args = tokens.slice(1);
-
-        // Item-by-item paths: subcommands where iteration is natural.
-        if (sub === 'log') {
-            const a = mri(args, {
-                alias: { n: 'max-count' },
-                boolean: ['oneline', 'all'],
-                string: ['author', 'since', 'until']
-            });
-            const ref = a._[0] ? String(a._[0]) : undefined;
-            const commits = await this.log({
-                depth: a['max-count'] ? Number(a['max-count']) : undefined,
-                ref,
-                author: a.author ? String(a.author) : undefined,
-                since: a.since ? new Date(String(a.since)) : undefined,
-                until: a.until ? new Date(String(a.until)) : undefined
-            });
-            for (const c of commits) {
-                this._checkSignal(options.signal);
-                if (a.oneline) {
-                    yield `${c.sha.slice(0, 7)} ${c.message.trim().split('\n')[0]}`;
-                } else {
-                    const date = new Date(c.timestamp).toString();
-                    yield `commit ${c.sha}`;
-                    yield `Author: ${c.author} <${c.email}>`;
-                    yield `Date:   ${date}`;
-                    yield '';
-                    yield `    ${c.message.trim().replace(/\n/g, '\n    ')}`;
-                    yield '';
-                }
-            }
+        const { handler, args } = this._dispatch(cmd);
+        if (!handler) return;
+        const ctx = { mg: this, signal: options.signal };
+        if (handler.stream) {
+            yield* handler.stream(ctx, args);
             return;
         }
-
-        if (sub === 'ls-files') {
-            const files = await this.listTrackedFiles();
-            for (const f of files) {
-                this._checkSignal(options.signal);
-                yield f;
-            }
-            return;
-        }
-
-        if (sub === 'rev-list') {
-            const a = mri(args, {
-                boolean: ['all', 'reverse'],
-                alias: { 'max-count': 'n' }
-            });
-            const ref = a._[0] ? String(a._[0]) : undefined;
-            const oids = await this.revList({
-                all: !!a.all,
-                reverse: !!a.reverse,
-                maxCount: a['max-count'] ? Number(a['max-count']) : undefined,
-                ref
-            });
-            for (const oid of oids) {
-                this._checkSignal(options.signal);
-                yield oid;
-            }
-            return;
-        }
-
-        // Fallback: run the subcommand to completion, then yield per line.
-        const output = await this.exec(cmd, options);
+        const output = await handler.run(ctx, args);
         if (!output) return;
         const lines = output.split('\n');
-        // Drop a single trailing empty line — keeps blank middle lines intact.
         if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
         for (const line of lines) {
             this._checkSignal(options.signal);
@@ -2324,14 +1912,22 @@ export class MemoryGit {
     }
 
     /**
-     * Parses 'Name <email>' or 'Name' string into Author
+     * Tokenize a command string and look up the handler. Returns a falsy
+     * handler for an empty input (mirrors `git` with no args). Throws on an
+     * unknown subcommand.
      * @private
      */
-    private _parseAuthor(s: string): Author {
-        const m = s.match(/^\s*(.+?)\s*<(.+?)>\s*$/);
-        if (m) return { name: m[1], email: m[2] };
-        return { name: s.trim(), email: this.author.email };
+    private _dispatch(cmd: string): { handler: Command | undefined; args: string[] } {
+        const tokens = shellParse(cmd).filter((t): t is string => typeof t === 'string');
+        if (tokens.length === 0) return { handler: undefined, args: [] };
+        if (tokens[0] === 'git') tokens.shift();
+        if (tokens.length === 0) return { handler: undefined, args: [] };
+        const sub = tokens.shift()!;
+        const handler = getCommand(sub);
+        if (!handler) throw new Error(`memory-git: '${sub}' is not a supported command`);
+        return { handler, args: tokens };
     }
+
 
     /**
      * Gets estimated memory usage
