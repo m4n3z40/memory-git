@@ -7,6 +7,8 @@ import { parse as shellParse } from 'shell-quote';
 import mri from 'mri';
 import ignore from 'ignore';
 
+import { OperationLog } from './operation-log.js';
+
 type MemFs = ReturnType<typeof createFsFromVolume>;
 
 // Public types live in ./types.ts. Re-exported for backwards-compatible
@@ -123,8 +125,7 @@ export class MemoryGit {
     /** Author information for commits */
     author: Author = { name: 'Memory Git', email: 'memory@git.local' };
     
-    private operations: OperationLogEntry[] = [];
-    private _listeners: Set<OperationListener> = new Set();
+    private _log: OperationLog = new OperationLog();
     private _stash: StashedFile[][] = [];
     /**
      * Workdir paths known to have been written/deleted since the last add/sync.
@@ -158,35 +159,21 @@ export class MemoryGit {
      * @returns Unsubscribe function.
      */
     onOperation(callback: OperationListener): () => void {
-        this._listeners.add(callback);
-        return () => { this._listeners.delete(callback); };
+        return this._log.subscribe(callback);
     }
 
     /**
-     * Logs an operation
+     * Records an operation entry. Internal — the OperationLog instance owns
+     * sanitization and observer dispatch.
      * @private
      */
     private _logOperation(
         operation: string,
         params: Record<string, unknown>,
         result: unknown = null,
-        error: Error | null = null
+        error: Error | null = null,
     ): OperationLogEntry {
-        const entry: OperationLogEntry = {
-            timestamp: new Date().toISOString(),
-            operation,
-            params: this._sanitizeParams(params),
-            success: error === null,
-            result: result,
-            error: error ? error.message : null
-        };
-        this.operations.push(entry);
-        for (const cb of this._listeners) {
-            try { cb(entry); } catch (e) {
-                if (process.env.MEMORY_GIT_DEBUG) console.error('onOperation listener threw:', e);
-            }
-        }
-        return entry;
+        return this._log.record(operation, params, result, error);
     }
 
     /**
@@ -215,24 +202,9 @@ export class MemoryGit {
             signal.addEventListener('abort', onAbort, { once: true });
             promise.then(
                 v => { signal.removeEventListener('abort', onAbort); resolve(v); },
-                e => { signal.removeEventListener('abort', onAbort); reject(e); }
+                e => { signal.removeEventListener('abort', onAbort); reject(e); },
             );
         });
-    }
-
-    /**
-     * Removes large data from params for logging
-     * @private
-     */
-    private _sanitizeParams(params: Record<string, unknown>): Record<string, unknown> {
-        const sanitized = { ...params };
-        if (sanitized.content && typeof sanitized.content === 'string' && sanitized.content.length > 100) {
-            sanitized.content = `[${sanitized.content.length} bytes]`;
-        }
-        if (Buffer.isBuffer(sanitized.content)) {
-            sanitized.content = `[Buffer: ${sanitized.content.length} bytes]`;
-        }
-        return sanitized;
     }
 
     /**
@@ -1436,60 +1408,25 @@ export class MemoryGit {
         }
     }
 
-    /**
-     * Returns the history of all operations performed
-     * @returns List of operations
-     */
+    /** Returns the history of all operations performed. */
     getOperationsLog(): OperationLogEntry[] {
-        return [...this.operations];
+        return this._log.getEntries();
     }
 
-    /**
-     * Clears the operation log
-     */
+    /** Clears the operation log (and records the clear itself as an entry). */
     clearOperationsLog(): void {
-        this.operations = [];
+        this._log.clear();
         this._logOperation('clearOperationsLog', {}, { success: true });
     }
 
-    /**
-     * Gets operation statistics
-     * @returns Statistics
-     */
+    /** Aggregated counts by operation, success/failure. */
     getOperationsStats(): OperationStats {
-        const stats: OperationStats = {
-            total: this.operations.length,
-            successful: this.operations.filter(op => op.success).length,
-            failed: this.operations.filter(op => !op.success).length,
-            byOperation: {}
-        };
-        
-        for (const op of this.operations) {
-            if (!stats.byOperation[op.operation]) {
-                stats.byOperation[op.operation] = { total: 0, successful: 0, failed: 0 };
-            }
-            stats.byOperation[op.operation].total++;
-            if (op.success) {
-                stats.byOperation[op.operation].successful++;
-            } else {
-                stats.byOperation[op.operation].failed++;
-            }
-        }
-        
-        return stats;
+        return this._log.getStats();
     }
 
-    /**
-     * Exports the operation log in JSON format
-     * @returns JSON string of operations
-     */
+    /** JSON dump of the log + stats, suitable for storing or feeding back into a model. */
     exportOperationsLog(): string {
-        return JSON.stringify({
-            name: this.name,
-            exportedAt: new Date().toISOString(),
-            stats: this.getOperationsStats(),
-            operations: this.operations
-        }, null, 2);
+        return this._log.exportJson(this.name);
     }
 
     /**
@@ -2583,7 +2520,7 @@ export class MemoryGit {
             files: Object.keys(json).length,
             estimatedSizeBytes: totalSize,
             estimatedSizeMB: (totalSize / 1024 / 1024).toFixed(2),
-            operationsLogged: this.operations.length
+            operationsLogged: this._log.size
         };
     }
 }
