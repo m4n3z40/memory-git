@@ -432,25 +432,38 @@ const g2 = new MemoryGit('b'); // independent volume, no interference
 
 ## Performance
 
-Run `pnpm run benchmark` to compare against the real git CLI (numbers from local SSD, Node 26):
+Run `pnpm run benchmark` to reproduce.
 
 | Workload | Git CLI (`execSync`) | MemoryGit | Result |
 |---|---|---|---|
-| Subprocess spawn overhead | ~2-4ms / call | none | — |
-| `exec()` parsing overhead (tokenize + flag-parse) | — | ~7µs / call | negligible |
-| 400 small commands (status / log / rev-parse / branch) | 1104ms | 100ms | **11× faster** |
-| 100 sequential commits | 865ms | 372ms | **2.3× faster** |
-| 200 status / write / add / commit / log cycles | 3540ms | 1798ms | **2× faster** |
-| 50× repeated `git log` | 167ms | 124ms | **1.3× faster** |
-| Init + 50 files + commit + branch + merge | 274ms | 273ms | tied |
+| Process spawn overhead | ~12-13ms / call | none | — |
+| `exec()` parsing overhead (tokenize + flag-parse) | — | ~3-6µs / call | negligible |
+| 400 small commands (status / log / rev-parse / branch) | 5581ms | 43ms | **129× faster** |
+| 100 sequential commits | 3499ms | 176ms | **19.9× faster** |
+| 200 status / write / add / commit / log cycles | 15723ms | 1050ms | **15.0× faster** |
+| 50× repeated `git log` | 703ms | 37ms | **18.8× faster** |
+| Init + 50 files + commit + branch + merge | 958ms | 102ms | **9.4× faster** |
 
 Three takeaways:
 
-1. **`exec()` parsing is free.** It adds ~7µs to a call that previously cost 2-4ms via subprocess. The string-API ergonomics carry no real cost.
-2. **The agent-loop pattern is the killer use case.** Many small read-style calls amortize the JS-level overhead and let MemoryGit skip the per-call spawn tax — 11× faster end-to-end.
-3. **Multi-file commits are now faster too.** A dirty-set tracker (writeFile marks files as needing re-stage; `add('.')` only touches those) means write-heavy workloads beat the C binary on local SSD.
+1. **`exec()` parsing is free.** It adds 3-6µs to a call that previously cost ~12ms via subprocess. The string-API ergonomics carry no real cost.
+2. **The agent-loop pattern is the killer use case.** Many small read-style calls amortize JS-level overhead and skip the per-call spawn tax — **>100× faster end-to-end**.
+3. **Multi-file commits are also faster.** A dirty-set tracker (writeFile marks files as needing re-stage; `add('.')` only touches those) means write-heavy workloads beat the C binary on local SSD too.
 
 **The gap widens dramatically on slow filesystems.** Git's `.git/objects/` is small-file-heavy by design (one file per blob, tree, and commit), which is the worst-case access pattern for EFS, NFS, and overlay/networked dev-container volumes. A `git log` over a large history that runs in 50ms on local SSD can take tens of seconds on EFS — every object is a round-trip. MemoryGit keeps all that in RAM and only flushes the actual working-tree files back when you ask it to.
+
+<details>
+<summary>Benchmark machine</summary>
+
+- Apple M4 Pro · 12 cores · 24 GB RAM
+- macOS 26.3.1
+- APFS on internal NVMe SSD
+- Node.js v26.1.0
+- memory-git v3.1.1, isomorphic-git v1.37, memfs v4.57
+
+Numbers vary per machine; the ratios are what matter, and they grow on slower disks.
+
+</details>
 
 ## Dependencies
 
