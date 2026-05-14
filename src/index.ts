@@ -98,6 +98,8 @@ export interface CloneOptions {
     branch?: string;
     /** Skip checking out files after clone */
     noCheckout?: boolean;
+    /** Abort the clone in flight. Throws AbortError on abort. */
+    signal?: AbortSignal;
     [key: string]: unknown;
 }
 
@@ -185,6 +187,8 @@ export interface FetchOptions {
     singleBranch?: boolean;
     /** Specific ref to fetch */
     ref?: string;
+    /** Abort the fetch in flight. Throws AbortError on abort. */
+    signal?: AbortSignal;
 }
 
 export interface PullOptions {
@@ -196,6 +200,8 @@ export interface PullOptions {
     fastForwardOnly?: boolean;
     /** Only fast-forward (no merge commit) */
     fastForward?: boolean;
+    /** Abort the pull in flight. Throws AbortError on abort. */
+    signal?: AbortSignal;
 }
 
 export interface PushOptions {
@@ -209,6 +215,8 @@ export interface PushOptions {
     force?: boolean;
     /** Delete the remote ref */
     delete?: boolean;
+    /** Abort the push in flight. Throws AbortError on abort. */
+    signal?: AbortSignal;
 }
 
 export interface LogOptions {
@@ -291,6 +299,15 @@ interface StashedFile {
     deleted?: boolean;
 }
 
+/** Options accepted by exec/execStream */
+export interface ExecOptions {
+    /** Abort the in-flight operation. Throws AbortError on abort. */
+    signal?: AbortSignal;
+}
+
+/** Callback type for the operation-log observer */
+export type OperationListener = (op: OperationLogEntry) => void;
+
 /**
  * MemoryGit - In-memory Git implementation
  * 
@@ -316,6 +333,7 @@ export class MemoryGit {
     author: Author = { name: 'Memory Git', email: 'memory@git.local' };
     
     private operations: OperationLogEntry[] = [];
+    private _listeners: Set<OperationListener> = new Set();
     private _stash: StashedFile[][] = [];
     /**
      * Workdir paths known to have been written/deleted since the last add/sync.
@@ -336,13 +354,31 @@ export class MemoryGit {
     }
 
     /**
+     * Public Node-fs-compatible interface backed by the in-memory Volume.
+     * Use when integrating with libraries that need an IFs-shaped filesystem
+     * (e.g. memory-git/just-bash-fs).
+     */
+    get volume(): MemFs {
+        return this.fs;
+    }
+
+    /**
+     * Subscribe to operation-log entries as they are recorded.
+     * @returns Unsubscribe function.
+     */
+    onOperation(callback: OperationListener): () => void {
+        this._listeners.add(callback);
+        return () => { this._listeners.delete(callback); };
+    }
+
+    /**
      * Logs an operation
      * @private
      */
     private _logOperation(
-        operation: string, 
-        params: Record<string, unknown>, 
-        result: unknown = null, 
+        operation: string,
+        params: Record<string, unknown>,
+        result: unknown = null,
         error: Error | null = null
     ): OperationLogEntry {
         const entry: OperationLogEntry = {
@@ -354,7 +390,43 @@ export class MemoryGit {
             error: error ? error.message : null
         };
         this.operations.push(entry);
+        for (const cb of this._listeners) {
+            try { cb(entry); } catch (e) {
+                if (process.env.MEMORY_GIT_DEBUG) console.error('onOperation listener threw:', e);
+            }
+        }
         return entry;
+    }
+
+    /**
+     * Throws an AbortError if the given signal is aborted. Web-standard shape.
+     * @private
+     */
+    private _checkSignal(signal?: AbortSignal): void {
+        if (signal?.aborted) {
+            throw new DOMException('The operation was aborted.', 'AbortError');
+        }
+    }
+
+    /**
+     * Races a promise against an AbortSignal. If the signal aborts before the
+     * promise settles, throws AbortError. The underlying operation continues
+     * running internally — callers are responsible for any rollback.
+     * @private
+     */
+    private _withSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+        if (!signal) return promise;
+        if (signal.aborted) {
+            return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
+        }
+        return new Promise<T>((resolve, reject) => {
+            const onAbort = () => reject(new DOMException('The operation was aborted.', 'AbortError'));
+            signal.addEventListener('abort', onAbort, { once: true });
+            promise.then(
+                v => { signal.removeEventListener('abort', onAbort); resolve(v); },
+                e => { signal.removeEventListener('abort', onAbort); reject(e); }
+            );
+        });
     }
 
     /**
@@ -1965,11 +2037,12 @@ export class MemoryGit {
      */
     async clone(url: string, options: CloneOptions = {}): Promise<boolean> {
         try {
+            this._checkSignal(options.signal);
             this.fs.mkdirSync(this.dir, { recursive: true });
 
-            const { depth, singleBranch, branch, noCheckout, ...rest } = options;
+            const { depth, singleBranch, branch, noCheckout, signal, ...rest } = options;
 
-            await git.clone({
+            await this._withSignal(git.clone({
                 fs: this.fs,
                 http,
                 dir: this.dir,
@@ -1979,7 +2052,7 @@ export class MemoryGit {
                 ref: branch,
                 noCheckout: noCheckout || false,
                 ...rest
-            });
+            }), signal);
 
             this.isInitialized = true;
             // After clone, workdir and index are in sync — nothing pending
@@ -2002,7 +2075,8 @@ export class MemoryGit {
         const remote = options.remote ?? 'origin';
 
         try {
-            await git.fetch({
+            this._checkSignal(options.signal);
+            await this._withSignal(git.fetch({
                 fs: this.fs,
                 http,
                 dir: this.dir,
@@ -2012,7 +2086,7 @@ export class MemoryGit {
                 depth: options.depth,
                 singleBranch: options.singleBranch,
                 ref: options.ref
-            });
+            }), options.signal);
             this._logOperation('fetch', { remote, options }, { success: true });
             return true;
         } catch (error) {
@@ -2037,9 +2111,10 @@ export class MemoryGit {
         const remote = options.remote ?? 'origin';
 
         try {
+            this._checkSignal(options.signal);
             const currentBranchName = options.branch || await this.currentBranch();
 
-            await git.pull({
+            await this._withSignal(git.pull({
                 fs: this.fs,
                 http,
                 dir: this.dir,
@@ -2048,7 +2123,7 @@ export class MemoryGit {
                 author: this.author,
                 fastForward: options.fastForward,
                 fastForwardOnly: options.fastForwardOnly
-            });
+            }), options.signal);
 
             this._logOperation('pull', { remote, branch: currentBranchName, options }, { success: true });
             return true;
@@ -2075,7 +2150,8 @@ export class MemoryGit {
         const remote = options.remote ?? 'origin';
 
         try {
-            const result = await git.push({
+            this._checkSignal(options.signal);
+            const result = await this._withSignal(git.push({
                 fs: this.fs,
                 http,
                 dir: this.dir,
@@ -2084,7 +2160,7 @@ export class MemoryGit {
                 remoteRef: options.remoteRef,
                 force: options.force,
                 delete: options.delete
-            });
+            }), options.signal);
             this._logOperation('push', { remote, options }, { success: true });
             return result;
         } catch (error) {
@@ -2237,7 +2313,8 @@ export class MemoryGit {
      *
      * Throws on unknown commands or when the underlying operation fails.
      */
-    async exec(cmd: string): Promise<string> {
+    async exec(cmd: string, options: ExecOptions = {}): Promise<string> {
+        this._checkSignal(options.signal);
         const tokens = shellParse(cmd).filter((t): t is string => typeof t === 'string');
         if (tokens.length === 0) return '';
         if (tokens[0] === 'git') tokens.shift();
@@ -2245,6 +2322,7 @@ export class MemoryGit {
 
         const sub = tokens.shift()!;
         const args = tokens;
+        const signal = options.signal;
 
         switch (sub) {
             case 'init': {
@@ -2486,7 +2564,8 @@ export class MemoryGit {
                     branch: a.branch ? String(a.branch) : undefined,
                     singleBranch: !!a['single-branch'],
                     noCheckout: !!a['no-checkout'],
-                    depth: a.depth ? Number(a.depth) : undefined
+                    depth: a.depth ? Number(a.depth) : undefined,
+                    signal
                 });
                 return `Cloning into '${this.dir}'...`;
             }
@@ -2497,7 +2576,8 @@ export class MemoryGit {
                     remote,
                     prune: !!a.prune,
                     tags: !!a.tags,
-                    depth: a.depth ? Number(a.depth) : undefined
+                    depth: a.depth ? Number(a.depth) : undefined,
+                    signal
                 });
                 return '';
             }
@@ -2507,7 +2587,8 @@ export class MemoryGit {
                 await this.pull({
                     remote: remote || 'origin',
                     branch: branch || undefined,
-                    fastForwardOnly: !!a['ff-only']
+                    fastForwardOnly: !!a['ff-only'],
+                    signal
                 });
                 return '';
             }
@@ -2518,7 +2599,8 @@ export class MemoryGit {
                     remote: remote || 'origin',
                     ref: ref || undefined,
                     force: !!a.force,
-                    delete: !!a.delete
+                    delete: !!a.delete,
+                    signal
                 });
                 return '';
             }
@@ -2585,6 +2667,101 @@ export class MemoryGit {
             }
             default:
                 throw new Error(`memory-git: '${sub}' is not a supported command`);
+        }
+    }
+
+    /**
+     * Streaming variant of {@link exec}. Yields one logical line at a time.
+     *
+     * Subcommands that iterate naturally (log, ls-files, rev-list) yield item-by-item;
+     * other subcommands compute the full output, then yield per `\n`. Empty trailing
+     * lines are dropped. The signal is checked before each yield.
+     *
+     * Example:
+     *   for await (const line of mg.execStream('git log --oneline')) {
+     *     if (shouldStop()) break;
+     *     console.log(line);
+     *   }
+     */
+    async *execStream(cmd: string, options: ExecOptions = {}): AsyncIterable<string> {
+        this._checkSignal(options.signal);
+        const tokens = shellParse(cmd).filter((t): t is string => typeof t === 'string');
+        if (tokens.length === 0) return;
+        if (tokens[0] === 'git') tokens.shift();
+        if (tokens.length === 0) return;
+
+        const sub = tokens[0];
+        const args = tokens.slice(1);
+
+        // Item-by-item paths: subcommands where iteration is natural.
+        if (sub === 'log') {
+            const a = mri(args, {
+                alias: { n: 'max-count' },
+                boolean: ['oneline', 'all'],
+                string: ['author', 'since', 'until']
+            });
+            const ref = a._[0] ? String(a._[0]) : undefined;
+            const commits = await this.log({
+                depth: a['max-count'] ? Number(a['max-count']) : undefined,
+                ref,
+                author: a.author ? String(a.author) : undefined,
+                since: a.since ? new Date(String(a.since)) : undefined,
+                until: a.until ? new Date(String(a.until)) : undefined
+            });
+            for (const c of commits) {
+                this._checkSignal(options.signal);
+                if (a.oneline) {
+                    yield `${c.sha.slice(0, 7)} ${c.message.trim().split('\n')[0]}`;
+                } else {
+                    const date = new Date(c.timestamp).toString();
+                    yield `commit ${c.sha}`;
+                    yield `Author: ${c.author} <${c.email}>`;
+                    yield `Date:   ${date}`;
+                    yield '';
+                    yield `    ${c.message.trim().replace(/\n/g, '\n    ')}`;
+                    yield '';
+                }
+            }
+            return;
+        }
+
+        if (sub === 'ls-files') {
+            const files = await this.listTrackedFiles();
+            for (const f of files) {
+                this._checkSignal(options.signal);
+                yield f;
+            }
+            return;
+        }
+
+        if (sub === 'rev-list') {
+            const a = mri(args, {
+                boolean: ['all', 'reverse'],
+                alias: { 'max-count': 'n' }
+            });
+            const ref = a._[0] ? String(a._[0]) : undefined;
+            const oids = await this.revList({
+                all: !!a.all,
+                reverse: !!a.reverse,
+                maxCount: a['max-count'] ? Number(a['max-count']) : undefined,
+                ref
+            });
+            for (const oid of oids) {
+                this._checkSignal(options.signal);
+                yield oid;
+            }
+            return;
+        }
+
+        // Fallback: run the subcommand to completion, then yield per line.
+        const output = await this.exec(cmd, options);
+        if (!output) return;
+        const lines = output.split('\n');
+        // Drop a single trailing empty line — keeps blank middle lines intact.
+        if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+        for (const line of lines) {
+            this._checkSignal(options.signal);
+            yield line;
         }
     }
 

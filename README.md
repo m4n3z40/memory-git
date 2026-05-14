@@ -231,8 +231,93 @@ Every method records an entry in the operation log. This is what makes MemoryGit
 | `getOperationsStats()` | Aggregated counts by operation, success/failure |
 | `exportOperationsLog()` | JSON string suitable for storing or feeding back to a model |
 | `clearOperationsLog()` | Reset the log |
+| `onOperation(cb)` | Subscribe to log entries as they're recorded; returns an unsubscribe function |
 | `getMemoryUsage()` | Estimated bytes / file count |
 | `getRepoInfo()` | Repo summary |
+
+```typescript
+const unsub = mg.onOperation(op => {
+    tracing.record(op.operation, { ok: op.success, ms: 0, err: op.error });
+});
+// ...later
+unsub();
+```
+
+Listener errors are swallowed (set `MEMORY_GIT_DEBUG=1` to log them); they will never break a git op.
+
+### Streaming output
+
+Long results (a 1000-commit log, every tracked path) don't have to be buffered.
+`execStream()` yields one logical line at a time, lets you break early, and
+respects an `AbortSignal`.
+
+```typescript
+for await (const line of mg.execStream('git log --oneline')) {
+    if (shouldStop()) break;
+    process.stdout.write(line + '\n');
+}
+```
+
+`log`, `ls-files`, and `rev-list` yield item-by-item; other subcommands compute
+the full output then yield line-by-line.
+
+### Cancellation
+
+`exec()`, `execStream()`, `clone()`, `fetch()`, `pull()`, and `push()` accept a
+standard `AbortSignal`. On abort, the awaited promise rejects with a Web-standard
+`AbortError` (`DOMException`).
+
+```typescript
+const ctrl = new AbortController();
+setTimeout(() => ctrl.abort(), 5000);
+try {
+    await mg.clone(url, { signal: ctrl.signal });
+} catch (e) {
+    if ((e as DOMException).name === 'AbortError') {
+        // request was cancelled; mutation, if any, is left as-is
+    }
+}
+```
+
+Any state mutated before abort stays mutated — rollback (e.g. `mg.clear()` and
+retry) is the caller's responsibility.
+
+### Integration with just-bash
+
+The `memory-git/adapters/just-bash` sub-export wraps a `MemoryGit` instance in
+[just-bash](https://www.npmjs.com/package/just-bash)'s `IFileSystem` interface,
+so a single in-memory Volume can serve both git ops and shell ops. Install
+`just-bash` only if you use this sub-export.
+
+```typescript
+import { MemoryGit } from 'memory-git';
+import { toJustBashFs } from 'memory-git/adapters/just-bash';
+import { Bash } from 'just-bash';
+
+const mg = new MemoryGit();
+await mg.init();
+
+const bash = new Bash({ fs: toJustBashFs(mg) });
+await bash.run('echo "hello" > /repo/greet.txt');
+
+await mg.add('greet.txt');
+await mg.commit('add greeting');
+```
+
+Pass `onWrite` to be notified after every mutating call — useful for tracking
+dirty paths for write-behind flushing:
+
+```typescript
+import { MemfsBackedFs } from 'memory-git/adapters/just-bash';
+
+const dirty = new Set<string>();
+const fs = new MemfsBackedFs(mg.volume, {
+    onWrite: (path, op) => { dirty.add(path); }
+});
+```
+
+If you need the raw Node-fs-compatible interface for other libraries, use
+`mg.volume` directly — it returns the same in-memory `IFs` object.
 
 ## Patterns for agent workflows
 
