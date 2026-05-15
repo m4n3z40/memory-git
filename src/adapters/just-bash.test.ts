@@ -265,4 +265,150 @@ describe('MemfsBackedFs (just-bash IFileSystem adapter)', () => {
         const sha = await mg.commit('add via adapter');
         expect(sha).toMatch(/^[0-9a-f]{40}$/);
     });
+
+    describe('readOnly (explicit adapter option)', () => {
+        let ro: MemfsBackedFs;
+        let roWrites: Array<[string, FsWriteOp]>;
+
+        beforeEach(async () => {
+            await mg.volume.promises.writeFile('/repo/seed.txt', 'seed');
+            await mg.volume.promises.mkdir('/repo/seeddir', { recursive: true });
+            await mg.volume.promises.writeFile('/repo/seeddir/inner.txt', 'inner');
+            roWrites = [];
+            ro = new MemfsBackedFs(mg.volume, {
+                readOnly: true,
+                onWrite: (p, op) => roWrites.push([p, op]),
+            });
+        });
+
+        it('reads still work', async () => {
+            expect(await ro.readFile('/repo/seed.txt')).toBe('seed');
+            expect(await ro.exists('/repo/seed.txt')).toBe(true);
+            const names = await ro.readdir('/repo/seeddir');
+            expect(names).toContain('inner.txt');
+        });
+
+        it.each([
+            ['writeFile', () => ro.writeFile('/repo/x.txt', 'x')],
+            ['appendFile', () => ro.appendFile('/repo/seed.txt', '!')],
+            ['mkdir', () => ro.mkdir('/repo/newdir')],
+            ['rm', () => ro.rm('/repo/seed.txt')],
+            ['cp', () => ro.cp('/repo/seed.txt', '/repo/seed-copy.txt')],
+            ['mv', () => ro.mv('/repo/seed.txt', '/repo/moved.txt')],
+            ['chmod', () => ro.chmod('/repo/seed.txt', 0o644)],
+            ['symlink', () => ro.symlink('/repo/seed.txt', '/repo/seed-link')],
+            ['link', () => ro.link('/repo/seed.txt', '/repo/seed-hard')],
+            ['utimes', () => ro.utimes('/repo/seed.txt', new Date(), new Date())],
+        ])('%s rejects with EROFS', async (_name, fn) => {
+            await expect(fn()).rejects.toMatchObject({ code: 'EROFS' });
+        });
+
+        it('failed writes do not mutate the volume or fire onWrite', async () => {
+            await expect(ro.writeFile('/repo/x.txt', 'x')).rejects.toMatchObject({ code: 'EROFS' });
+            expect(await ro.exists('/repo/x.txt')).toBe(false);
+            expect(roWrites).toEqual([]);
+        });
+    });
+
+    it('toJustBashFs default is writable when mg is writable', async () => {
+        const adapter = toJustBashFs(mg);
+        await adapter.writeFile('/repo/ok.txt', 'ok', undefined);
+        expect(await adapter.readFile('/repo/ok.txt')).toBe('ok');
+    });
+});
+
+describe('MemoryGit.readOnlyView()', () => {
+    let mg: MemoryGit;
+    let view: MemoryGit;
+
+    beforeEach(async () => {
+        mg = new MemoryGit('shared');
+        await mg.init();
+        mg.setAuthor('A', 'a@a');
+        view = mg.readOnlyView();
+    });
+
+    it('view reports readOnly=true while parent stays writable', () => {
+        expect(view.readOnly).toBe(true);
+        expect(mg.readOnly).toBe(false);
+    });
+
+    it('view shares the same Volume — parent writes are visible to the view live', async () => {
+        await mg.writeFile('hello.txt', 'hi');
+        expect(await view.readFile('hello.txt')).toBe('hi');
+        await mg.add('hello.txt');
+        const sha = await mg.commit('first');
+        const log = await view.log();
+        expect(log).toHaveLength(1);
+        expect(log[0].sha).toBe(sha);
+    });
+
+    it('view sees parent isInitialized / author / realDir live (delegated)', async () => {
+        // isInitialized was true before view creation; flip it via another bootstrap path
+        // and verify the view tracks it.
+        const fresh = new MemoryGit('fresh');
+        const freshView = fresh.readOnlyView();
+        expect(freshView.readOnly).toBe(true);
+        // Not initialized yet — parent and view agree.
+        expect(fresh.isInitialized).toBe(false);
+        expect(freshView.isInitialized).toBe(false);
+        await fresh.init();
+        // Parent's mutation flows through the view's delegating getter.
+        expect(fresh.isInitialized).toBe(true);
+        expect(freshView.isInitialized).toBe(true);
+
+        // Author flows through similarly.
+        fresh.setAuthor('Bob', 'b@b');
+        expect(freshView.author).toEqual({ name: 'Bob', email: 'b@b' });
+    });
+
+    it('every mutating method on the view throws EROFS', async () => {
+        await expect(view.writeFile('x', 'x')).rejects.toMatchObject({ code: 'EROFS' });
+        await expect(view.add('x')).rejects.toMatchObject({ code: 'EROFS' });
+        await expect(view.commit('x')).rejects.toMatchObject({ code: 'EROFS' });
+        await expect(view.createBranch('feat')).rejects.toMatchObject({ code: 'EROFS' });
+        await expect(view.init()).rejects.toMatchObject({ code: 'EROFS' });
+        await expect(view.config('user.name', 'Bob')).rejects.toMatchObject({ code: 'EROFS' });
+        expect(() => view.setAuthor('x', 'x@x')).toThrowError(
+            expect.objectContaining({ code: 'EROFS' }),
+        );
+        await expect(view.exec('git add foo')).rejects.toMatchObject({ code: 'EROFS' });
+    });
+
+    it('reads keep working on the view (no EROFS leakage)', async () => {
+        await mg.config('user.name', 'Alice');
+        await mg.writeFile('r.txt', 'r');
+        await mg.add('r.txt');
+        await mg.commit('seed');
+        expect(await view.readFile('r.txt')).toBe('r');
+        expect(await view.config('user.name')).toBe('Alice');
+        expect((await view.log()).length).toBe(1);
+        const status = await view.exec('git status --short');
+        expect(typeof status).toBe('string');
+    });
+
+    it('the view is permanently read-only — `_readOnly` is locked at the descriptor level', () => {
+        expect(view.readOnly).toBe(true);
+        // Sanity-check that the contract isn't trivially bypassable.
+        expect(() => {
+            (view as unknown as { _readOnly: boolean })._readOnly = false;
+        }).toThrow(TypeError);
+        expect(view.readOnly).toBe(true);
+    });
+
+    it('toJustBashFs(view) is automatically read-only; toJustBashFs(parent) is RW on same Volume', async () => {
+        await mg.writeFile('seed.txt', 'seed');
+
+        const readFs = toJustBashFs(view);
+        const writeFs = toJustBashFs(mg);
+
+        // Read handle: sees the file, can't mutate.
+        expect(await readFs.readFile('/repo/seed.txt')).toBe('seed');
+        await expect(readFs.writeFile('/repo/x.txt', 'x', undefined))
+            .rejects.toMatchObject({ code: 'EROFS' });
+
+        // Write handle: writes pass through, and the view (same Volume) sees them.
+        await writeFs.writeFile('/repo/via-write.txt', 'w', undefined);
+        expect(await readFs.readFile('/repo/via-write.txt')).toBe('w');
+    });
 });

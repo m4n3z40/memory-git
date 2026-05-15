@@ -58,6 +58,25 @@ export interface MemfsBackedFsOptions {
      * write-behind flushing.
      */
     onWrite?: (path: string, op: FsWriteOp) => void;
+    /**
+     * If true, every mutating operation rejects with an `EROFS: read-only
+     * file system` error instead of touching the underlying volume. Reads
+     * still work normally. Useful when constructing `MemfsBackedFs`
+     * directly over a raw `IFs`; when going through `toJustBashFs(mg)`,
+     * the flag is taken from `mg.readOnly` automatically.
+     */
+    readOnly?: boolean;
+}
+
+function throwEROFS(syscall: string, path: string): never {
+    const err = new Error(
+        `EROFS: read-only file system, ${syscall} '${path}'`,
+    ) as NodeJS.ErrnoException;
+    err.code = 'EROFS';
+    err.errno = -30;
+    err.syscall = syscall;
+    err.path = path;
+    throw err;
 }
 
 export class MemfsBackedFs implements IFileSystem {
@@ -169,6 +188,7 @@ export class MemfsBackedFs implements IFileSystem {
         content: FileContent,
         options?: WriteFileOptions | BufferEncoding,
     ): Promise<void> {
+        if (this.opts.readOnly) throwEROFS('open', path);
         await this.vol.promises.writeFile(path, content as any, options as any);
         this.opts.onWrite?.(path, 'write');
     }
@@ -178,21 +198,25 @@ export class MemfsBackedFs implements IFileSystem {
         content: FileContent,
         options?: WriteFileOptions | BufferEncoding,
     ): Promise<void> {
+        if (this.opts.readOnly) throwEROFS('open', path);
         await this.vol.promises.appendFile(path, content as any, options as any);
         this.opts.onWrite?.(path, 'append');
     }
 
     async mkdir(path: string, options?: MkdirOptions): Promise<void> {
+        if (this.opts.readOnly) throwEROFS('mkdir', path);
         await this.vol.promises.mkdir(path, options);
         this.opts.onWrite?.(path, 'mkdir');
     }
 
     async rm(path: string, options?: RmOptions): Promise<void> {
+        if (this.opts.readOnly) throwEROFS('unlink', path);
         await this.vol.promises.rm(path, options);
         this.opts.onWrite?.(path, 'rm');
     }
 
     async cp(src: string, dest: string, options?: CpOptions): Promise<void> {
+        if (this.opts.readOnly) throwEROFS('copyfile', dest);
         const promisesCp = (this.vol.promises as any).cp;
         if (typeof promisesCp === 'function') {
             await promisesCp.call(this.vol.promises, src, dest, { recursive: !!options?.recursive });
@@ -203,27 +227,32 @@ export class MemfsBackedFs implements IFileSystem {
     }
 
     async mv(src: string, dest: string): Promise<void> {
+        if (this.opts.readOnly) throwEROFS('rename', src);
         await this.vol.promises.rename(src, dest);
         this.opts.onWrite?.(src, 'mv');
         this.opts.onWrite?.(dest, 'mv');
     }
 
     async chmod(path: string, mode: number): Promise<void> {
+        if (this.opts.readOnly) throwEROFS('chmod', path);
         await this.vol.promises.chmod(path, mode);
         this.opts.onWrite?.(path, 'chmod');
     }
 
     async symlink(target: string, linkPath: string): Promise<void> {
+        if (this.opts.readOnly) throwEROFS('symlink', linkPath);
         await this.vol.promises.symlink(target, linkPath);
         this.opts.onWrite?.(linkPath, 'symlink');
     }
 
     async link(existing: string, newPath: string): Promise<void> {
+        if (this.opts.readOnly) throwEROFS('link', newPath);
         await this.vol.promises.link(existing, newPath);
         this.opts.onWrite?.(newPath, 'link');
     }
 
     async utimes(path: string, atime: Date, mtime: Date): Promise<void> {
+        if (this.opts.readOnly) throwEROFS('utimes', path);
         await this.vol.promises.utimes(path, atime, mtime);
         this.opts.onWrite?.(path, 'utimes');
     }
@@ -271,7 +300,16 @@ function toFsStat(s: any): FsStat {
  *   const bash = new Bash({ fs: toJustBashFs(mg) });
  *   await bash.run("echo hi > /repo/hi.txt");
  *   await mg.add('hi.txt'); await mg.commit('add hi.txt');
+ *
+ * The adapter inherits `mg.readOnly`. The canonical pattern when one
+ * consumer needs a read handle and another a write handle on the *same*
+ * Volume:
+ *
+ *   const mg = new MemoryGit(projectId);
+ *   await mg.init();
+ *   const readFs  = toJustBashFs(mg.readOnlyView());  // automatically RO
+ *   const writeFs = toJustBashFs(mg);                  // RW; shares Volume
  */
 export function toJustBashFs(mg: MemoryGit, options?: MemfsBackedFsOptions): IFileSystem {
-    return new MemfsBackedFs(mg.volume, options);
+    return new MemfsBackedFs(mg.volume, { ...options, readOnly: mg.readOnly });
 }

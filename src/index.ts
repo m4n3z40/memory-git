@@ -159,13 +159,93 @@ export class MemoryGit {
     private _snapshotPath: string | null = null;
 
     /**
-     * Creates a new MemoryGit instance
+     * Read-only flag. False on regular instances; locked to `true` on the
+     * sibling returned by `readOnlyView()`.
+     */
+    private _readOnly: boolean = false;
+
+    /**
+     * Creates a new MemoryGit instance.
      * @param name - Unique name to identify the instance
      */
     constructor(name: string = 'memory-git') {
         this.name = name;
         this.vol = new Volume();
         this.fs = createFsFromVolume(this.vol);
+    }
+
+    /**
+     * Whether this instance is read-only. True only for instances produced
+     * by `readOnlyView()`; every mutating method on such an instance
+     * rejects with `EROFS`. Regular instances always return false.
+     */
+    get readOnly(): boolean {
+        return this._readOnly;
+    }
+
+    /**
+     * Returns a read-only sibling that shares this instance's Volume and
+     * internal state. Writes performed on the parent (or via
+     * `toJustBashFs(parent)`) are visible to the view immediately — they
+     * point at the same Volume. Every mutation method on the view rejects
+     * with `EROFS`, and `toJustBashFs(view)` follows that automatically.
+     *
+     * Use when one consumer needs a read handle and another a write handle
+     * on the same in-memory repo:
+     *
+     *   const mg = new MemoryGit(projectId);
+     *   await mg.init();
+     *   const mgRead = mg.readOnlyView();
+     *   new ReadStrategy(mgRead);       // toJustBashFs(mgRead) is RO
+     *   new WriteStrategy(mg, queue);   // toJustBashFs(mg) is RW
+     */
+    readOnlyView(): MemoryGit {
+        const parent = this;
+        const view = Object.create(MemoryGit.prototype) as MemoryGit;
+
+        // Field initializers don't run when we bypass the constructor with
+        // Object.create. Wire every field on the view to read/write the
+        // parent's slot, so the view sees parent mutations (volume, refs,
+        // dirty set, log) live.
+        const sharedFields = [
+            'name', 'fs', 'vol', 'dir',
+            'realDir', 'isInitialized', 'author',
+            '_log', '_stash', '_dirtyFiles', '_diskSnapshot', '_snapshotPath',
+        ] as const;
+        for (const key of sharedFields) {
+            Object.defineProperty(view, key, {
+                get: () => Reflect.get(parent, key),
+                set: (v: unknown) => { Reflect.set(parent, key, v); },
+                enumerable: true,
+                configurable: true,
+            });
+        }
+
+        // The view's only divergence from the parent: a locked `_readOnly =
+        // true`. `writable: false` blocks `(view as any)._readOnly = false`
+        // from silently undoing the contract.
+        Object.defineProperty(view, '_readOnly', {
+            value: true,
+            writable: false,
+            configurable: false,
+        });
+
+        return view;
+    }
+
+    /**
+     * Throws an `EROFS` error if this instance is in read-only mode.
+     * @private
+     */
+    private _assertWritable(operation: string): void {
+        if (!this._readOnly) return;
+        const err = new Error(
+            `EROFS: read-only file system, ${operation}`,
+        ) as NodeJS.ErrnoException;
+        err.code = 'EROFS';
+        err.errno = -30;
+        err.syscall = operation;
+        throw err;
     }
 
     /**
@@ -251,6 +331,7 @@ export class MemoryGit {
      * @param email - Author email
      */
     setAuthor(name: string, email: string): void {
+        this._assertWritable('setAuthor');
         this.author = { name, email };
         this._logOperation('setAuthor', { name, email });
     }
@@ -269,6 +350,7 @@ export class MemoryGit {
                 this._logOperation('config', { key }, { success: true, value: v });
                 return v;
             }
+            this._assertWritable('config');
             await git.setConfig({ fs: this.fs, dir: this.dir, path: key, value });
             if (key === 'user.name') this.author = { ...this.author, name: value };
             else if (key === 'user.email') this.author = { ...this.author, email: value };
@@ -285,6 +367,7 @@ export class MemoryGit {
      * @param options - Init options (defaultBranch, bare)
      */
     async init(options: InitOptions = {}): Promise<boolean> {
+        this._assertWritable('init');
         const defaultBranch = options.defaultBranch ?? 'main';
         const bare = options.bare ?? false;
         try {
@@ -306,6 +389,7 @@ export class MemoryGit {
      * @returns Number of files loaded
      */
     async loadFromDisk(sourcePath: string, options: LoadFromDiskOptions = {}): Promise<number> {
+        this._assertWritable('loadFromDisk');
         try {
             const resolvedSource = pathNode.resolve(sourcePath);
             const respectGitignore = options.respectGitignore !== false;
@@ -414,6 +498,7 @@ export class MemoryGit {
      * @param content - File content
      */
     async writeFile(filepath: string, content: string | Buffer): Promise<boolean> {
+        this._assertWritable('writeFile');
         try {
             const fullPath = pathNode.posix.join(this.dir, filepath);
             const dir = pathNode.posix.dirname(fullPath);
@@ -466,6 +551,7 @@ export class MemoryGit {
      * @param filepath - Relative file path
      */
     async deleteFile(filepath: string): Promise<boolean> {
+        this._assertWritable('deleteFile');
         try {
             const fullPath = pathNode.posix.join(this.dir, filepath);
             this.fs.unlinkSync(fullPath);
@@ -484,6 +570,7 @@ export class MemoryGit {
      * @param options - {all} stages all changes (incl. untracked); {update} stages only tracked changes
      */
     async add(filepath: string | string[] = [], options: AddOptions = {}): Promise<boolean> {
+        this._assertWritable('add');
         try {
             const wantsAll = options.all || filepath === '.' || filepath === '-A';
             const wantsUpdate = options.update;
@@ -547,6 +634,7 @@ export class MemoryGit {
      * @param options - {cached: true} removes only from index, keeping the working file (git rm --cached)
      */
     async remove(filepath: string, options: RemoveOptions = {}): Promise<boolean> {
+        this._assertWritable('remove');
         try {
             await git.remove({ fs: this.fs, dir: this.dir, filepath });
 
@@ -573,6 +661,7 @@ export class MemoryGit {
      * @returns SHA of the created commit
      */
     async commit(message: string = '', options: CommitOptions = {}): Promise<string> {
+        this._assertWritable('commit');
         try {
             // Auto-stage tracked changes (git commit -a) — delegate to add({update}) which
             // walks workdir directly to avoid the memfs stat-cache miss in statusMatrix.
@@ -717,6 +806,7 @@ export class MemoryGit {
      * @param branchName - Branch name
      */
     async createBranch(branchName: string): Promise<boolean> {
+        this._assertWritable('createBranch');
         try {
             await git.branch({ fs: this.fs, dir: this.dir, ref: branchName });
             this._logOperation('createBranch', { branchName }, { success: true });
@@ -733,6 +823,7 @@ export class MemoryGit {
      * @param options - {force: true} skips the merged-into-current check (git branch -D)
      */
     async deleteBranch(branchName: string, options: DeleteBranchOptions = {}): Promise<boolean> {
+        this._assertWritable('deleteBranch');
         try {
             if (!options.force) {
                 const current = await git.currentBranch({ fs: this.fs, dir: this.dir });
@@ -771,6 +862,7 @@ export class MemoryGit {
      * @param newName - New branch name
      */
     async renameBranch(oldName: string, newName: string): Promise<boolean> {
+        this._assertWritable('renameBranch');
         try {
             await git.renameBranch({ fs: this.fs, dir: this.dir, ref: newName, oldref: oldName });
             this._logOperation('renameBranch', { oldName, newName }, { success: true });
@@ -787,6 +879,7 @@ export class MemoryGit {
      * @param options - {createBranch} like git checkout -b; {force} discard local changes; {files} restrict to paths
      */
     async checkout(branchName: string, options: CheckoutOptions = {}): Promise<boolean> {
+        this._assertWritable('checkout');
         try {
             if (options.createBranch) {
                 await git.branch({ fs: this.fs, dir: this.dir, ref: branchName, checkout: false });
@@ -852,6 +945,7 @@ export class MemoryGit {
      * @param options - Merge options
      */
     async merge(theirBranch: string, options: MergeOptions = {}): Promise<MergeResult> {
+        this._assertWritable('merge');
         try {
             const result = await git.merge({
                 fs: this.fs,
@@ -879,6 +973,7 @@ export class MemoryGit {
      * @param url - Remote URL
      */
     async addRemote(remoteName: string, url: string): Promise<boolean> {
+        this._assertWritable('addRemote');
         try {
             await git.addRemote({ fs: this.fs, dir: this.dir, remote: remoteName, url });
             this._logOperation('addRemote', { remoteName, url }, { success: true });
@@ -894,6 +989,7 @@ export class MemoryGit {
      * @param remoteName - Remote name
      */
     async deleteRemote(remoteName: string): Promise<boolean> {
+        this._assertWritable('deleteRemote');
         try {
             await git.deleteRemote({ fs: this.fs, dir: this.dir, remote: remoteName });
             this._logOperation('deleteRemote', { remoteName }, { success: true });
@@ -930,6 +1026,7 @@ export class MemoryGit {
         refOrOptions: string | CreateTagOptions = 'HEAD',
         options: CreateTagOptions = {}
     ): Promise<boolean> {
+        this._assertWritable('createTag');
         const opts: CreateTagOptions =
             typeof refOrOptions === 'string'
                 ? { ref: refOrOptions, ...options }
@@ -1021,6 +1118,7 @@ export class MemoryGit {
      * @param tagName - Tag name to delete
      */
     async deleteTag(tagName: string): Promise<boolean> {
+        this._assertWritable('deleteTag');
         try {
             const tags = await git.listTags({ fs: this.fs, dir: this.dir });
             if (!tags.includes(tagName)) {
@@ -1043,6 +1141,7 @@ export class MemoryGit {
      * @returns OID of the target commit
      */
     async reset(ref: string = 'HEAD', options?: ResetOptions): Promise<string> {
+        this._assertWritable('reset');
         const mode = options?.mode ?? 'mixed';
         try {
             const oid = await this._resolveAny(ref);
@@ -1115,6 +1214,7 @@ export class MemoryGit {
      * @param newPath - New file path (relative)
      */
     async rename(oldPath: string, newPath: string, options: RenameOptions = {}): Promise<boolean> {
+        this._assertWritable('rename');
         try {
             const fullOldPath = pathNode.posix.join(this.dir, oldPath);
             const fullNewPath = pathNode.posix.join(this.dir, newPath);
@@ -1559,8 +1659,9 @@ export class MemoryGit {
      * @param filepath - File path
      */
     async resetFile(filepath: string): Promise<boolean> {
+        this._assertWritable('resetFile');
         try {
-            await git.checkout({ 
+            await git.checkout({
                 fs: this.fs, 
                 dir: this.dir, 
                 filepaths: [filepath],
@@ -1579,6 +1680,7 @@ export class MemoryGit {
      * @returns Number of files saved to stash
      */
     async stash(): Promise<number> {
+        this._assertWritable('stash');
         try {
             // Walk workdir + tracked directly to avoid memfs/statusMatrix cache miss
             const workdirFiles = new Set(listFilesRecursive(this.fs, this.dir));
@@ -1650,6 +1752,7 @@ export class MemoryGit {
      * @returns Number of files restored
      */
     async stashPop(): Promise<number> {
+        this._assertWritable('stashPop');
         try {
             if (this._stash.length === 0) {
                 throw new Error('No stash available');
@@ -1697,6 +1800,7 @@ export class MemoryGit {
      * @param options - Clone options
      */
     async clone(url: string, options: CloneOptions = {}): Promise<boolean> {
+        this._assertWritable('clone');
         try {
             this._checkSignal(options.signal);
             this.fs.mkdirSync(this.dir, { recursive: true });
@@ -1731,6 +1835,7 @@ export class MemoryGit {
      * @param remoteOrOptions - Remote name string (legacy) or FetchOptions
      */
     async fetch(remoteOrOptions: string | FetchOptions = 'origin'): Promise<boolean> {
+        this._assertWritable('fetch');
         const options: FetchOptions =
             typeof remoteOrOptions === 'string' ? { remote: remoteOrOptions } : remoteOrOptions;
         const remote = options.remote ?? 'origin';
@@ -1765,6 +1870,7 @@ export class MemoryGit {
         remoteOrOptions: string | PullOptions = 'origin',
         branch: string | null = null
     ): Promise<boolean> {
+        this._assertWritable('pull');
         const options: PullOptions =
             typeof remoteOrOptions === 'string'
                 ? { remote: remoteOrOptions, branch: branch ?? undefined }
@@ -1804,6 +1910,7 @@ export class MemoryGit {
         remoteOrOptions: string | PushOptions = 'origin',
         ref?: string
     ): Promise<unknown> {
+        this._assertWritable('push');
         const options: PushOptions =
             typeof remoteOrOptions === 'string'
                 ? { remote: remoteOrOptions, ref }
@@ -1834,6 +1941,7 @@ export class MemoryGit {
      * Clears the in-memory filesystem and reinitializes
      */
     async clear(): Promise<boolean> {
+        this._assertWritable('clear');
         try {
             this.vol.reset();
             this.isInitialized = false;
