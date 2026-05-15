@@ -12,12 +12,30 @@
 
 import { promises as fsRealAsync } from 'fs';
 import type { Dirent } from 'fs';
+import { createHash } from 'crypto';
 import pathNode from 'path';
 import type { createFsFromVolume } from 'memfs';
 import type ignore from 'ignore';
 
 export type MemFs = ReturnType<typeof createFsFromVolume>;
 export type Matcher = ReturnType<typeof ignore>;
+
+/**
+ * One row of the disk-sync snapshot. Tracks the state of a file on disk at
+ * the moment it was last read or written by us. The `size + mtimeMs` pair is
+ * the fast pre-filter for disk→memory (skip without reading); `hash` is the
+ * authoritative comparator for memory→disk (skip without writing).
+ */
+export interface FileFingerprint {
+    size: number;
+    mtimeMs: number;
+    hash: string;
+}
+
+/** SHA-1 of a buffer, hex-encoded. Same algorithm git uses internally. */
+export function hashBuffer(buf: Buffer): string {
+    return createHash('sha1').update(buf).digest('hex');
+}
 
 /** Cheap existence probe — `access` is the smallest "does it exist" call. */
 export async function realPathExists(filepath: string): Promise<boolean> {
@@ -163,6 +181,148 @@ export async function copyMemoryToDisk(
 
     const results = await Promise.all(promises);
     return results.reduce((acc, val) => acc + val, 0);
+}
+
+/**
+ * Incremental disk→memory: walks the real tree and only reads files whose
+ * `(size, mtimeMs)` differ from the snapshot. Updates `snapshot` in place
+ * with fingerprints of files that were read. Adds every relative file path
+ * encountered (even skipped ones) to `seen`, so the caller can detect files
+ * deleted on disk by diffing snapshot keys against `seen`.
+ *
+ * Mirrors `copyDiskToMemory` for ignore semantics: `.git/` is always copied
+ * regardless of matcher rules.
+ */
+export async function copyDiskToMemoryIncremental(
+    fs: MemFs,
+    realPath: string,
+    memoryPath: string,
+    matcher: Matcher,
+    relPath: string,
+    snapshot: Map<string, FileFingerprint>,
+    seen: Set<string>,
+): Promise<{ read: number; skipped: number }> {
+    const entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
+
+    const results = await Promise.all(entries.map(async (entry) => {
+        const entryRel = relPath ? pathNode.posix.join(relPath, entry.name) : entry.name;
+
+        const insideGit = entryRel === '.git' || entryRel.startsWith('.git/');
+        if (!insideGit) {
+            const probe = entry.isDirectory() ? `${entryRel}/` : entryRel;
+            if (matcher.ignores(probe)) return { read: 0, skipped: 0 };
+        }
+
+        const realEntryPath = pathNode.join(realPath, entry.name);
+        const memoryEntryPath = pathNode.posix.join(memoryPath, entry.name);
+
+        if (entry.isDirectory()) {
+            fs.mkdirSync(memoryEntryPath, { recursive: true });
+            return await copyDiskToMemoryIncremental(
+                fs, realEntryPath, memoryEntryPath, matcher, entryRel, snapshot, seen,
+            );
+        }
+
+        if (entry.isFile()) {
+            seen.add(entryRel);
+            const stat = await fsRealAsync.stat(realEntryPath);
+            const prior = snapshot.get(entryRel);
+            // Fast pre-filter: same size + same mtime ⇒ disk hasn't changed.
+            if (prior && prior.size === stat.size && prior.mtimeMs === stat.mtimeMs) {
+                return { read: 0, skipped: 1 };
+            }
+            const content = await fsRealAsync.readFile(realEntryPath);
+            fs.writeFileSync(memoryEntryPath, content);
+            snapshot.set(entryRel, {
+                size: stat.size,
+                mtimeMs: stat.mtimeMs,
+                hash: hashBuffer(content),
+            });
+            return { read: 1, skipped: 0 };
+        }
+
+        return { read: 0, skipped: 0 };
+    }));
+
+    let read = 0;
+    let skipped = 0;
+    for (const r of results) {
+        read += r.read;
+        skipped += r.skipped;
+    }
+    return { read, skipped };
+}
+
+/**
+ * Incremental memory→disk: walks the in-memory tree and only writes files
+ * whose content hash differs from the snapshot (using size as a cheap
+ * pre-filter). Updates `snapshot` in place after each write. Adds every
+ * relative file path encountered to `seen` so the caller can implement
+ * `clean: true` by deleting paths in `snapshot` not in `seen`.
+ *
+ * Snapshot is treated as authoritative for the on-disk state — we do not
+ * stat the destination. That keeps the hot path off slow filesystems
+ * (the EFS/NFS use case); the trade-off is that external modifications
+ * between flushes are invisible until the user calls loadFromDisk again.
+ */
+export async function copyMemoryToDiskIncremental(
+    fs: MemFs,
+    memoryPath: string,
+    realPath: string,
+    relPath: string,
+    snapshot: Map<string, FileFingerprint>,
+    seen: Set<string>,
+): Promise<{ written: number; skipped: number }> {
+    const entries = fs.readdirSync(memoryPath) as string[];
+
+    const results = await Promise.all(entries.map(async (entry) => {
+        const memoryEntryPath = pathNode.posix.join(memoryPath, entry);
+        const realEntryPath = pathNode.join(realPath, entry);
+        const entryRel = relPath ? pathNode.posix.join(relPath, entry) : entry;
+
+        const stat = fs.statSync(memoryEntryPath);
+
+        if (stat.isDirectory()) {
+            const dirExists = await realPathExists(realEntryPath);
+            if (!dirExists) {
+                await fsRealAsync.mkdir(realEntryPath, { recursive: true });
+            }
+            return await copyMemoryToDiskIncremental(
+                fs, memoryEntryPath, realEntryPath, entryRel, snapshot, seen,
+            );
+        }
+
+        seen.add(entryRel);
+        const content = fs.readFileSync(memoryEntryPath) as Buffer;
+        const size = content.length;
+        const prior = snapshot.get(entryRel);
+
+        // Size mismatch ⇒ definitely changed; skip hashing.
+        if (prior && prior.size === size) {
+            const hash = hashBuffer(content);
+            if (prior.hash === hash) {
+                return { written: 0, skipped: 1 };
+            }
+            await fsRealAsync.writeFile(realEntryPath, content);
+            const newStat = await fsRealAsync.stat(realEntryPath);
+            snapshot.set(entryRel, { size, mtimeMs: newStat.mtimeMs, hash });
+            return { written: 1, skipped: 0 };
+        }
+
+        const hash = hashBuffer(content);
+        await fsRealAsync.writeFile(realEntryPath, content);
+        const newStat = await fsRealAsync.stat(realEntryPath);
+        snapshot.set(entryRel, { size, mtimeMs: newStat.mtimeMs, hash });
+        return { written: 1, skipped: 0 };
+    }));
+
+    let written = 0;
+    let skipped = 0;
+    for (const r of results) {
+        written += r.written;
+        skipped += r.skipped;
+    }
+    return { written, skipped };
 }
 
 /**

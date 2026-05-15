@@ -77,11 +77,24 @@ export interface LoadFromDiskOptions {
     respectGitignore?: boolean;
     /** Also respect nested .gitignore files in subdirectories (default: true; requires respectGitignore). */
     nestedGitignore?: boolean;
+    /**
+     * Read only files whose (size, mtimeMs) differ from the last sync (default: false).
+     * On first incremental call the snapshot is empty, so the cost matches a full load
+     * plus hashing; subsequent calls skip unchanged files entirely. Files removed from
+     * disk are deleted from memory.
+     */
+    incremental?: boolean;
 }
 
 export interface FlushOptions {
-    /** Remove files that don't exist in memory (default: false) */
+    /** Remove files on disk that no longer exist in memory (default: false). Requires incremental:true — the snapshot is what defines "no longer exists". */
     clean?: boolean;
+    /**
+     * Write only files whose content hash differs from the last sync (default: false).
+     * Trusts the snapshot — external modifications to the destination between flushes are not detected.
+     * Call loadFromDisk({incremental:true}) to resync the snapshot if external writes happen.
+     */
+    incremental?: boolean;
 }
 
 export interface CloneOptions {

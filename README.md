@@ -136,10 +136,10 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `setAuthor(name, email)` | Sets commit author |
 | `config(key, value?)` | Get/set git config (special-cases `user.name`/`user.email` to sync with author) |
 | `init(options?)` | Initializes empty repo. `{defaultBranch, bare}` |
-| `loadFromDisk(path, options?)` | Loads existing repo. `{respectGitignore, nestedGitignore, ignore}` — by default skips files matching root + nested `.gitignore` files |
+| `loadFromDisk(path, options?)` | Loads existing repo. `{respectGitignore, nestedGitignore, ignore, incremental}` — by default skips files matching root + nested `.gitignore` files |
 | `clone(url, options?)` | Clones remote. `{branch, depth, singleBranch, noCheckout}` |
 | `clear()` | Resets memory state |
-| `flush(targetPath?)` | Syncs memory to disk |
+| `flush(targetPath?, options?)` | Syncs memory to disk. `{incremental, clean}` |
 
 ### Files
 
@@ -398,6 +398,29 @@ await mg.loadFromDisk('./existing-repo', {
 await mg.flush();                       // back to original path
 await mg.flush('./output-dir');         // or somewhere else
 ```
+
+### Incremental sync
+
+Both `loadFromDisk` and `flush` accept `incremental: true`. With it on, MemoryGit keeps a per-file fingerprint of the last sync state and only reads/writes files that changed.
+
+```typescript
+const mg = new MemoryGit();
+
+// First call: full read, plus build the fingerprint snapshot.
+await mg.loadFromDisk('./repo', { incremental: true });
+
+// Later — pick up only the files that changed on disk (size/mtime pre-filter):
+await mg.loadFromDisk('./repo', { incremental: true });
+
+// ...mutate a few files in memory...
+await mg.writeFile('src/a.ts', '// edited');
+
+// Only files whose content hash differs from the snapshot are written.
+// Use clean:true to also delete files removed from memory.
+await mg.flush('./repo', { incremental: true, clean: true });
+```
+
+When incremental flush is on, the snapshot is treated as authoritative for the destination — we don't stat disk on every file. External writes between flushes are invisible until you `loadFromDisk({incremental:true})` again. This is the trade-off that makes it cheap on EFS/NFS, where one stat per file dominates the cost.
 
 ## TypeScript
 

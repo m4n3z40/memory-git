@@ -938,6 +938,160 @@ describe('MemoryGit', () => {
                 expect(files.some(f => f.startsWith('build/'))).toBe(true);
             });
         });
+
+        describe('incremental', () => {
+            const incDir = '/tmp/memory-git-incremental-test';
+
+            beforeEach(async () => {
+                await fs.rm(incDir, { recursive: true, force: true });
+                await fs.mkdir(incDir, { recursive: true });
+                await fs.mkdir(path.join(incDir, 'src'), { recursive: true });
+                await fs.writeFile(path.join(incDir, 'README.md'), '# v1');
+                await fs.writeFile(path.join(incDir, 'src/a.js'), 'a');
+                await fs.writeFile(path.join(incDir, 'src/b.js'), 'b');
+            });
+
+            afterEach(async () => {
+                await fs.rm(incDir, { recursive: true, force: true });
+            });
+
+            it('skips files whose mtime+size are unchanged on second incremental load', async () => {
+                await memGit.loadFromDisk(incDir, { incremental: true });
+
+                const log1 = memGit.getOperationsLog();
+                const op1 = log1[log1.length - 1].result as { read: number; skipped: number };
+                expect(op1.read).toBeGreaterThan(0);
+                expect(op1.skipped).toBe(0);
+
+                await memGit.loadFromDisk(incDir, { incremental: true });
+
+                const log2 = memGit.getOperationsLog();
+                const op2 = log2[log2.length - 1].result as { read: number; skipped: number };
+                expect(op2.read).toBe(0);
+                expect(op2.skipped).toBeGreaterThan(0);
+            });
+
+            it('re-reads only files whose disk mtime/size changed', async () => {
+                await memGit.loadFromDisk(incDir, { incremental: true });
+
+                // Modify one file's content + mtime
+                const target = path.join(incDir, 'src/a.js');
+                await fs.writeFile(target, 'a-updated');
+                // Make mtime distinct from the first write
+                const future = new Date(Date.now() + 5000);
+                await fs.utimes(target, future, future);
+
+                await memGit.loadFromDisk(incDir, { incremental: true });
+                const log = memGit.getOperationsLog();
+                const op = log[log.length - 1].result as { read: number; skipped: number };
+                expect(op.read).toBe(1);
+
+                expect(await memGit.readFile('src/a.js')).toBe('a-updated');
+                expect(await memGit.readFile('src/b.js')).toBe('b');
+            });
+
+            it('removes files from memory when they disappear from disk', async () => {
+                await memGit.loadFromDisk(incDir, { incremental: true });
+                expect(await memGit.fileExists('src/b.js')).toBe(true);
+
+                await fs.unlink(path.join(incDir, 'src/b.js'));
+                await memGit.loadFromDisk(incDir, { incremental: true });
+
+                expect(await memGit.fileExists('src/b.js')).toBe(false);
+                expect(await memGit.fileExists('src/a.js')).toBe(true);
+            });
+        });
+    });
+
+    describe('Incremental Flush', () => {
+        const srcDir = '/tmp/memory-git-flush-src';
+        const dstDir = '/tmp/memory-git-flush-dst';
+
+        beforeEach(async () => {
+            await fs.rm(srcDir, { recursive: true, force: true });
+            await fs.rm(dstDir, { recursive: true, force: true });
+            await fs.mkdir(srcDir, { recursive: true });
+            await fs.mkdir(path.join(srcDir, 'src'), { recursive: true });
+            await fs.writeFile(path.join(srcDir, 'README.md'), '# v1');
+            await fs.writeFile(path.join(srcDir, 'src/a.js'), 'a');
+            await fs.writeFile(path.join(srcDir, 'src/b.js'), 'b');
+        });
+
+        afterEach(async () => {
+            await fs.rm(srcDir, { recursive: true, force: true });
+            await fs.rm(dstDir, { recursive: true, force: true });
+        });
+
+        it('writes nothing on a clean second flush', async () => {
+            await memGit.loadFromDisk(srcDir, { incremental: true });
+            await memGit.flush(dstDir, { incremental: true });
+            const log1 = memGit.getOperationsLog();
+            const op1 = log1[log1.length - 1].result as { written: number; skipped: number };
+            expect(op1.written).toBeGreaterThan(0);
+
+            await memGit.flush(dstDir, { incremental: true });
+            const log2 = memGit.getOperationsLog();
+            const op2 = log2[log2.length - 1].result as { written: number; skipped: number };
+            expect(op2.written).toBe(0);
+            expect(op2.skipped).toBeGreaterThan(0);
+        });
+
+        it('writes only files whose content changed in memory', async () => {
+            await memGit.loadFromDisk(srcDir, { incremental: true });
+            await memGit.flush(dstDir, { incremental: true });
+
+            await memGit.writeFile('src/a.js', 'a-changed');
+
+            await memGit.flush(dstDir, { incremental: true });
+            const log = memGit.getOperationsLog();
+            const op = log[log.length - 1].result as { written: number; skipped: number };
+            expect(op.written).toBe(1);
+
+            const onDisk = await fs.readFile(path.join(dstDir, 'src/a.js'), 'utf8');
+            expect(onDisk).toBe('a-changed');
+        });
+
+        it('clean:true removes files that no longer exist in memory', async () => {
+            await memGit.loadFromDisk(srcDir, { incremental: true });
+            await memGit.flush(dstDir, { incremental: true });
+
+            expect(await fs.access(path.join(dstDir, 'src/b.js')).then(() => true, () => false)).toBe(true);
+
+            await memGit.deleteFile('src/b.js');
+            await memGit.flush(dstDir, { incremental: true, clean: true });
+
+            expect(await fs.access(path.join(dstDir, 'src/b.js')).then(() => true, () => false)).toBe(false);
+            expect(await fs.access(path.join(dstDir, 'src/a.js')).then(() => true, () => false)).toBe(true);
+        });
+
+        it('clean:false (default) leaves orphans on disk', async () => {
+            await memGit.loadFromDisk(srcDir, { incremental: true });
+            await memGit.flush(dstDir, { incremental: true });
+
+            await memGit.deleteFile('src/b.js');
+            await memGit.flush(dstDir, { incremental: true });
+
+            expect(await fs.access(path.join(dstDir, 'src/b.js')).then(() => true, () => false)).toBe(true);
+        });
+
+        it('switching destination invalidates the snapshot', async () => {
+            const altDst = '/tmp/memory-git-flush-alt';
+            await fs.rm(altDst, { recursive: true, force: true });
+            try {
+                await memGit.loadFromDisk(srcDir, { incremental: true });
+                await memGit.flush(dstDir, { incremental: true });
+
+                // Different destination → should rewrite everything despite same memfs.
+                await memGit.flush(altDst, { incremental: true });
+                const log = memGit.getOperationsLog();
+                const op = log[log.length - 1].result as { written: number };
+                expect(op.written).toBeGreaterThan(0);
+
+                expect(await fs.readFile(path.join(altDst, 'README.md'), 'utf8')).toBe('# v1');
+            } finally {
+                await fs.rm(altDst, { recursive: true, force: true });
+            }
+        });
     });
 
     describe('Parameter Sanitization in Log', () => {

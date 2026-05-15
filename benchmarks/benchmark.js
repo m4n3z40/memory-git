@@ -258,6 +258,95 @@ async function benchmarkMemoryGit(timer) {
 /**
  * Benchmark de carregamento de repositório existente
  */
+/**
+ * Compares full vs incremental load/flush across three scenarios:
+ *   - cold:      first call (snapshot empty)
+ *   - unchanged: same state as last sync
+ *   - one-edit:  exactly one file differs
+ *
+ * The point: incremental should pay a one-time hashing cost on the cold
+ * call and then collapse to near-zero on subsequent syncs.
+ */
+async function benchmarkIncrementalSync() {
+    console.log('\n' + '='.repeat(70));
+    console.log('BENCHMARK: Incremental load + flush');
+    console.log('='.repeat(70));
+
+    const srcDir = '/tmp/benchmark-incremental-src';
+    const dstDir = '/tmp/benchmark-incremental-dst';
+    const fileCount = 300;
+    const filesPerDir = 20;
+
+    await fs.rm(srcDir, { recursive: true, force: true });
+    await fs.rm(dstDir, { recursive: true, force: true });
+    await fs.mkdir(srcDir, { recursive: true });
+    // Spread files across nested dirs so the disk walk reflects real repos.
+    for (let i = 0; i < fileCount; i++) {
+        const dir = path.join(srcDir, `pkg${Math.floor(i / filesPerDir)}`);
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(path.join(dir, `file${i}.txt`), generateContent(512));
+    }
+
+    const time = async (fn) => {
+        const start = process.hrtime.bigint();
+        const result = await fn();
+        const end = process.hrtime.bigint();
+        return { ms: Number(end - start) / 1_000_000, result };
+    };
+
+    // --- LOAD ---
+    // Full load (baseline): every call is a complete walk + read.
+    const fullLoad = new MemoryGit('full-load');
+    const fullLoad1 = await time(() => fullLoad.loadFromDisk(srcDir));
+    await fullLoad.clear();
+    const fullLoad2 = await time(() => fullLoad.loadFromDisk(srcDir));
+
+    // Incremental load: cold pays full read + hash; warm skips by mtime+size.
+    const incLoad = new MemoryGit('inc-load');
+    const incCold = await time(() => incLoad.loadFromDisk(srcDir, { incremental: true }));
+    const incUnchanged = await time(() => incLoad.loadFromDisk(srcDir, { incremental: true }));
+
+    // Modify one file, bump mtime to a future value to defeat any FS coalescing.
+    const editPath = path.join(srcDir, 'pkg0/file0.txt');
+    await fs.writeFile(editPath, 'edited content');
+    const future = new Date(Date.now() + 5000);
+    await fs.utimes(editPath, future, future);
+    const incOneEdit = await time(() => incLoad.loadFromDisk(srcDir, { incremental: true }));
+
+    console.log(`\n📂 Load (${fileCount} files):`);
+    console.log(`   Full      (cold):       ${fullLoad1.ms.toFixed(2)}ms`);
+    console.log(`   Full      (repeat):     ${fullLoad2.ms.toFixed(2)}ms`);
+    console.log(`   Incremental (cold):     ${incCold.ms.toFixed(2)}ms   (read=${incCold.result})`);
+    console.log(`   Incremental (unchanged):${incUnchanged.ms.toFixed(2)}ms   ← speedup ${(fullLoad2.ms / Math.max(incUnchanged.ms, 0.01)).toFixed(1)}x vs full repeat`);
+    console.log(`   Incremental (1 edit):   ${incOneEdit.ms.toFixed(2)}ms   ← speedup ${(fullLoad2.ms / Math.max(incOneEdit.ms, 0.01)).toFixed(1)}x vs full repeat`);
+
+    // --- FLUSH ---
+    // Reuse the warm incremental instance — its memfs already mirrors disk.
+    const fullFlush1 = await time(() => incLoad.flush(dstDir));
+    await fs.rm(dstDir, { recursive: true, force: true });
+    const fullFlush2 = await time(() => incLoad.flush(dstDir));
+
+    // Re-open with a fresh incremental load → fresh snapshot, then incremental flushes.
+    await fs.rm(dstDir, { recursive: true, force: true });
+    const incFlushInstance = new MemoryGit('inc-flush');
+    await incFlushInstance.loadFromDisk(srcDir, { incremental: true });
+    const incFlushCold = await time(() => incFlushInstance.flush(dstDir, { incremental: true }));
+    const incFlushUnchanged = await time(() => incFlushInstance.flush(dstDir, { incremental: true }));
+
+    await incFlushInstance.writeFile('pkg0/file0.txt', 'mem-edit');
+    const incFlushOneEdit = await time(() => incFlushInstance.flush(dstDir, { incremental: true }));
+
+    console.log(`\n💾 Flush (${fileCount} files):`);
+    console.log(`   Full      (cold):       ${fullFlush1.ms.toFixed(2)}ms`);
+    console.log(`   Full      (repeat):     ${fullFlush2.ms.toFixed(2)}ms`);
+    console.log(`   Incremental (cold):     ${incFlushCold.ms.toFixed(2)}ms   (wrote=${incFlushCold.result})`);
+    console.log(`   Incremental (unchanged):${incFlushUnchanged.ms.toFixed(2)}ms   ← speedup ${(fullFlush2.ms / Math.max(incFlushUnchanged.ms, 0.01)).toFixed(1)}x vs full repeat`);
+    console.log(`   Incremental (1 edit):   ${incFlushOneEdit.ms.toFixed(2)}ms   ← speedup ${(fullFlush2.ms / Math.max(incFlushOneEdit.ms, 0.01)).toFixed(1)}x vs full repeat`);
+
+    await fs.rm(srcDir, { recursive: true, force: true });
+    await fs.rm(dstDir, { recursive: true, force: true });
+}
+
 async function benchmarkLoadFromDisk() {
     console.log('\n' + '='.repeat(70));
     console.log('BENCHMARK: Loading Existing Repository');
@@ -720,6 +809,9 @@ async function main() {
     
     // Loading benchmark
     await benchmarkLoadFromDisk();
+
+    // Incremental load + flush
+    await benchmarkIncrementalSync();
     
     // Intensive benchmark
     await benchmarkIntensive();

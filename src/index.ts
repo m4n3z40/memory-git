@@ -11,8 +11,11 @@ import {
     realPathExists,
     collectGitignorePatterns,
     copyDiskToMemory,
+    copyDiskToMemoryIncremental,
     copyMemoryToDisk,
+    copyMemoryToDiskIncremental,
     listFilesRecursive,
+    type FileFingerprint,
 } from './disk-sync.js';
 import { getCommand, type Command } from './commands/index.js';
 
@@ -141,6 +144,19 @@ export class MemoryGit {
      * Synced on: explicit add(paths), checkout, reset(hard), merge, stash, clone.
      */
     private _dirtyFiles: Set<string> = new Set();
+    /**
+     * Fingerprint of every file we know to be on disk, keyed by repo-relative
+     * path. Populated by `loadFromDisk({incremental})` and updated by
+     * `flush({incremental})`. Lets us skip reads/writes of files whose disk
+     * state matches what we last synced. Reset on `clear()`.
+     */
+    private _diskSnapshot: Map<string, FileFingerprint> = new Map();
+    /**
+     * Resolved disk path the snapshot represents. Different from `realDir`
+     * (which is the original load source) so that `flush(otherDir)` can build
+     * a snapshot keyed to that destination without losing it between calls.
+     */
+    private _snapshotPath: string | null = null;
 
     /**
      * Creates a new MemoryGit instance
@@ -291,22 +307,71 @@ export class MemoryGit {
      */
     async loadFromDisk(sourcePath: string, options: LoadFromDiskOptions = {}): Promise<number> {
         try {
-            this.realDir = pathNode.resolve(sourcePath);
+            const resolvedSource = pathNode.resolve(sourcePath);
             const respectGitignore = options.respectGitignore !== false;
             const nestedGitignore = options.nestedGitignore !== false;
             const explicitIgnore = options.ignore ?? [];
+            const incremental = options.incremental === true;
 
             // Build the matcher. .gitignore semantics: globs, negation, anchored paths.
             const matcher = ignore();
             matcher.add(explicitIgnore);
 
             if (respectGitignore) {
-                const patterns = await collectGitignorePatterns(this.realDir, nestedGitignore);
+                const patterns = await collectGitignorePatterns(resolvedSource, nestedGitignore);
                 if (patterns.length > 0) matcher.add(patterns);
             }
 
             this.fs.mkdirSync(this.dir, { recursive: true });
-            const fileCount = await copyDiskToMemory(this.fs, this.realDir, this.dir, matcher, '');
+
+            // Snapshot is path-scoped: switching source path invalidates it.
+            if (this._snapshotPath !== resolvedSource) {
+                this._diskSnapshot.clear();
+                this._snapshotPath = null;
+            }
+            this.realDir = resolvedSource;
+
+            let fileCount: number;
+            if (incremental) {
+                this._snapshotPath = resolvedSource;
+                const seen = new Set<string>();
+                const { read, skipped } = await copyDiskToMemoryIncremental(
+                    this.fs, this.realDir, this.dir, matcher, '', this._diskSnapshot, seen,
+                );
+                // Files known last time but no longer on disk → remove from memfs + snapshot.
+                let removed = 0;
+                for (const path of [...this._diskSnapshot.keys()]) {
+                    if (seen.has(path)) continue;
+                    this._diskSnapshot.delete(path);
+                    const fullPath = pathNode.posix.join(this.dir, path);
+                    try {
+                        this.fs.unlinkSync(fullPath);
+                        removed += 1;
+                    } catch {
+                        // Already gone or never written; ignore.
+                    }
+                }
+                fileCount = read + skipped;
+                this._logOperation('loadFromDisk', {
+                    sourcePath: this.realDir,
+                    respectGitignore,
+                    nestedGitignore,
+                    explicitIgnore,
+                    incremental: true,
+                }, { success: true, filesLoaded: fileCount, read, skipped, removed });
+            } else {
+                fileCount = await copyDiskToMemory(this.fs, this.realDir, this.dir, matcher, '');
+                // Full reload invalidates the snapshot — we no longer know which subset of
+                // memfs maps cleanly to disk fingerprints.
+                this._diskSnapshot.clear();
+                this._snapshotPath = null;
+                this._logOperation('loadFromDisk', {
+                    sourcePath: this.realDir,
+                    respectGitignore,
+                    nestedGitignore,
+                    explicitIgnore,
+                }, { success: true, filesLoaded: fileCount });
+            }
 
             // After load, every working-tree file is unsynced with the (likely empty) index.
             // Seed the dirty set so `add('.')` can pick them all up without rescanning.
@@ -315,12 +380,6 @@ export class MemoryGit {
             }
 
             this.isInitialized = true;
-            this._logOperation('loadFromDisk', {
-                sourcePath: this.realDir,
-                respectGitignore,
-                nestedGitignore,
-                explicitIgnore
-            }, { success: true, filesLoaded: fileCount });
             return fileCount;
         } catch (error) {
             this._logOperation('loadFromDisk', { sourcePath }, null, error as Error);
@@ -1336,13 +1395,57 @@ export class MemoryGit {
                 await fsRealAsync.mkdir(destination, { recursive: true });
             }
 
-            const fileCount = await copyMemoryToDisk(this.fs, this.dir, destination);
+            const incremental = options.incremental === true;
+            const clean = options.clean === true;
+
+            if (!incremental) {
+                const fileCount = await copyMemoryToDisk(this.fs, this.dir, destination);
+                // A full flush bypasses the snapshot; subsequent incremental flushes
+                // would have a stale baseline, so invalidate it.
+                this._diskSnapshot.clear();
+                this._snapshotPath = null;
+                this._logOperation('flush', { targetPath: destination, options }, {
+                    success: true,
+                    filesFlushed: fileCount,
+                });
+                return fileCount;
+            }
+
+            // Incremental path: the snapshot is keyed to a specific disk path.
+            // Flushing to a different path means we don't know its prior state.
+            if (this._snapshotPath !== destination) {
+                this._diskSnapshot.clear();
+                this._snapshotPath = destination;
+            }
+
+            const seen = new Set<string>();
+            const { written, skipped } = await copyMemoryToDiskIncremental(
+                this.fs, this.dir, destination, '', this._diskSnapshot, seen,
+            );
+
+            let removed = 0;
+            if (clean) {
+                for (const path of [...this._diskSnapshot.keys()]) {
+                    if (seen.has(path)) continue;
+                    const fullPath = pathNode.join(destination, path);
+                    try {
+                        await fsRealAsync.unlink(fullPath);
+                        removed += 1;
+                    } catch {
+                        // Not on disk or unreadable; either way, drop from snapshot.
+                    }
+                    this._diskSnapshot.delete(path);
+                }
+            }
 
             this._logOperation('flush', { targetPath: destination, options }, {
                 success: true,
-                filesFlushed: fileCount
+                filesFlushed: written,
+                written,
+                skipped,
+                removed,
             });
-            return fileCount;
+            return written;
         } catch (error) {
             this._logOperation('flush', { targetPath }, null, error as Error);
             throw error;
@@ -1736,6 +1839,8 @@ export class MemoryGit {
             this.isInitialized = false;
             this._stash = [];
             this._dirtyFiles.clear();
+            this._diskSnapshot.clear();
+            this._snapshotPath = null;
             this._logOperation('clear', {}, { success: true });
             return true;
         } catch (error) {
