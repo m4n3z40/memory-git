@@ -136,10 +136,10 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `setAuthor(name, email)` | Sets commit author |
 | `config(key, value?)` | Get/set git config (special-cases `user.name`/`user.email` to sync with author) |
 | `init(options?)` | Initializes empty repo. `{defaultBranch, bare}` |
-| `loadFromDisk(path, options?)` | Loads existing repo. `{respectGitignore, nestedGitignore, ignore, incremental}` — by default skips files matching root + nested `.gitignore` files |
+| `loadFromDisk(path, options?)` | Loads existing repo. `{respectGitignore, nestedGitignore, ignore, skipSnapshot}` — builds a fingerprint snapshot by default so subsequent `flush` calls are incremental; pass `skipSnapshot:true` to skip the hash pass |
 | `clone(url, options?)` | Clones remote. `{branch, depth, singleBranch, noCheckout}` |
 | `clear()` | Resets memory state |
-| `flush(targetPath?, options?)` | Syncs memory to disk. `{incremental, clean}` |
+| `flush(targetPath?, options?)` | Syncs memory to disk. `{clean, force}` — incremental by default; `force:true` does a full rewrite |
 
 ### Files
 
@@ -401,26 +401,45 @@ await mg.flush('./output-dir');         // or somewhere else
 
 ### Incremental sync
 
-Both `loadFromDisk` and `flush` accept `incremental: true`. With it on, MemoryGit keeps a per-file fingerprint of the last sync state and only reads/writes files that changed.
+**Since 3.4, incremental sync is the default.** `loadFromDisk` builds a per-file fingerprint (size + mtime + sha1) during the load, and `flush` uses it to write only files whose content actually changed.
 
 ```typescript
 const mg = new MemoryGit();
 
 // First call: full read, plus build the fingerprint snapshot.
-await mg.loadFromDisk('./repo', { incremental: true });
+await mg.loadFromDisk('./repo');
 
 // Later — pick up only the files that changed on disk (size/mtime pre-filter):
-await mg.loadFromDisk('./repo', { incremental: true });
+await mg.loadFromDisk('./repo');
 
 // ...mutate a few files in memory...
 await mg.writeFile('src/a.ts', '// edited');
 
 // Only files whose content hash differs from the snapshot are written.
 // Use clean:true to also delete files removed from memory.
-await mg.flush('./repo', { incremental: true, clean: true });
+await mg.flush('./repo', { clean: true });
 ```
 
-When incremental flush is on, the snapshot is treated as authoritative for the destination — we don't stat disk on every file. External writes between flushes are invisible until you `loadFromDisk({incremental:true})` again. This is the trade-off that makes it cheap on EFS/NFS, where one stat per file dominates the cost.
+The snapshot is treated as authoritative for the destination — we don't stat disk on every file. External writes between flushes are invisible until you `loadFromDisk()` again. This is the trade-off that makes it cheap on EFS/NFS, where one stat per file dominates the cost.
+
+#### Opting out
+
+You almost never want to opt out — the foot-gun this default is meant to prevent is asymmetric: forgetting `skipSnapshot` on load and then calling `flush` means flushing against an empty baseline, which silently rewrites every file (including `.git/objects/*`, which git leaves mode `0444` → `EACCES`). Three escape hatches, in order of granularity:
+
+```typescript
+// Per-call, on load: skip the hash pass for this load.
+await mg.loadFromDisk('./repo', { skipSnapshot: true });
+
+// Per-call, on flush: force a full rewrite (also invalidates the snapshot).
+await mg.flush('./repo', { force: true });
+
+// Per-instance: disable snapshot bookkeeping entirely (no warning on flush).
+const mg = new MemoryGit('agent', { tracksDiskSnapshot: false });
+```
+
+If `loadFromDisk` runs with `skipSnapshot:true` and `flush` is then called without `force:true`, MemoryGit logs a warning and falls back to a full rewrite — surfacing the foot-gun instead of silently doing expensive (and often failing) writes.
+
+The legacy `{incremental: true}` flag on both methods is accepted as a no-op alias of the new default so existing callers keep working.
 
 ## TypeScript
 

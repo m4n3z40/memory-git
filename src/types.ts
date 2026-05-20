@@ -78,23 +78,45 @@ export interface LoadFromDiskOptions {
     /** Also respect nested .gitignore files in subdirectories (default: true; requires respectGitignore). */
     nestedGitignore?: boolean;
     /**
-     * Read only files whose (size, mtimeMs) differ from the last sync (default: false).
-     * On first incremental call the snapshot is empty, so the cost matches a full load
-     * plus hashing; subsequent calls skip unchanged files entirely. Files removed from
-     * disk are deleted from memory.
+     * Skip building the (size, mtime, hash) snapshot during this load (default: false).
+     * Saves the hashing cost when you know you'll never call `flush` against the same
+     * destination, but a subsequent `flush` without `{force:true}` will warn and fall
+     * back to a full write because it has no baseline to diff against.
+     */
+    skipSnapshot?: boolean;
+    /**
+     * @deprecated Snapshot is built by default since 3.4. Accepted as a no-op alias
+     * so existing callers keep working. Pass `{skipSnapshot:true}` to opt out.
      */
     incremental?: boolean;
 }
 
 export interface FlushOptions {
-    /** Remove files on disk that no longer exist in memory (default: false). Requires incremental:true — the snapshot is what defines "no longer exists". */
+    /** Remove files on disk that no longer exist in the snapshot (default: false). Ignored when `force:true` or no snapshot is available. */
     clean?: boolean;
     /**
-     * Write only files whose content hash differs from the last sync (default: false).
-     * Trusts the snapshot — external modifications to the destination between flushes are not detected.
-     * Call loadFromDisk({incremental:true}) to resync the snapshot if external writes happen.
+     * Force a full rewrite of every file regardless of the snapshot (default: false).
+     * Use when you know the destination drifted out-of-band and you want to
+     * overwrite it wholesale. Invalidates the snapshot afterwards.
+     */
+    force?: boolean;
+    /**
+     * @deprecated Incremental flush is the default since 3.4. Accepted as a no-op alias
+     * so existing callers keep working. Pass `{force:true}` to force a full rewrite.
      */
     incremental?: boolean;
+}
+
+export interface MemoryGitOptions {
+    /**
+     * Whether this instance maintains a per-file disk snapshot used to make
+     * `loadFromDisk` and `flush` incremental (default: true). Set to `false` to
+     * permanently opt out: `loadFromDisk` skips the hash pass and `flush` always
+     * does a full rewrite — equivalent to passing `skipSnapshot`/`force` on
+     * every call, but silently (no warning on flush). Per-call `skipSnapshot`
+     * and `force` still apply when this is true.
+     */
+    tracksDiskSnapshot?: boolean;
 }
 
 export interface CloneOptions {

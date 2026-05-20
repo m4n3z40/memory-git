@@ -35,6 +35,7 @@ import type {
     MemoryUsage,
     LoadFromDiskOptions,
     FlushOptions,
+    MemoryGitOptions,
     CloneOptions,
     InitOptions,
     AddOptions,
@@ -75,6 +76,7 @@ export type {
     MemoryUsage,
     LoadFromDiskOptions,
     FlushOptions,
+    MemoryGitOptions,
     CloneOptions,
     InitOptions,
     AddOptions,
@@ -146,9 +148,9 @@ export class MemoryGit {
     private _dirtyFiles: Set<string> = new Set();
     /**
      * Fingerprint of every file we know to be on disk, keyed by repo-relative
-     * path. Populated by `loadFromDisk({incremental})` and updated by
-     * `flush({incremental})`. Lets us skip reads/writes of files whose disk
-     * state matches what we last synced. Reset on `clear()`.
+     * path. Populated by `loadFromDisk` (unless `skipSnapshot:true`) and
+     * updated by `flush`. Lets us skip reads/writes of files whose disk state
+     * matches what we last synced. Reset on `clear()`.
      */
     private _diskSnapshot: Map<string, FileFingerprint> = new Map();
     /**
@@ -157,6 +159,19 @@ export class MemoryGit {
      * a snapshot keyed to that destination without losing it between calls.
      */
     private _snapshotPath: string | null = null;
+    /**
+     * Per-instance toggle for snapshot tracking. False ⇒ `loadFromDisk` skips
+     * the hash pass and `flush` always does a full rewrite silently. Set via
+     * the constructor's `{tracksDiskSnapshot:false}` option.
+     */
+    private _tracksDiskSnapshot: boolean = true;
+    /**
+     * True when the last `loadFromDisk` ran with `skipSnapshot:true` and the
+     * caller therefore has no baseline. Used so flush can warn the user that
+     * it's silently falling back to a full rewrite instead of incremental.
+     * Cleared by any load/flush/clear that does build or invalidate a snapshot.
+     */
+    private _snapshotSkippedAtLoad: boolean = false;
 
     /**
      * Read-only flag. False on regular instances; locked to `true` on the
@@ -167,11 +182,15 @@ export class MemoryGit {
     /**
      * Creates a new MemoryGit instance.
      * @param name - Unique name to identify the instance
+     * @param options - Instance options (e.g. `{tracksDiskSnapshot:false}` to disable incremental sync entirely)
      */
-    constructor(name: string = 'memory-git') {
+    constructor(name: string = 'memory-git', options: MemoryGitOptions = {}) {
         this.name = name;
         this.vol = new Volume();
         this.fs = createFsFromVolume(this.vol);
+        if (options.tracksDiskSnapshot === false) {
+            this._tracksDiskSnapshot = false;
+        }
     }
 
     /**
@@ -211,6 +230,7 @@ export class MemoryGit {
             'name', 'fs', 'vol', 'dir',
             'realDir', 'isInitialized', 'author',
             '_log', '_stash', '_dirtyFiles', '_diskSnapshot', '_snapshotPath',
+            '_tracksDiskSnapshot', '_snapshotSkippedAtLoad',
         ] as const;
         for (const key of sharedFields) {
             Object.defineProperty(view, key, {
@@ -395,7 +415,12 @@ export class MemoryGit {
             const respectGitignore = options.respectGitignore !== false;
             const nestedGitignore = options.nestedGitignore !== false;
             const explicitIgnore = options.ignore ?? [];
-            const incremental = options.incremental === true;
+            // Snapshot is opt-out as of 3.4. Honour the instance-wide toggle
+            // first; otherwise `{skipSnapshot:true}` skips for this call. The
+            // legacy `{incremental:true}` is accepted as a no-op alias of the
+            // new default and never forces snapshot back on.
+            const buildSnapshot =
+                this._tracksDiskSnapshot && options.skipSnapshot !== true;
 
             // Build the matcher. .gitignore semantics: globs, negation, anchored paths.
             const matcher = ignore();
@@ -416,8 +441,9 @@ export class MemoryGit {
             this.realDir = resolvedSource;
 
             let fileCount: number;
-            if (incremental) {
+            if (buildSnapshot) {
                 this._snapshotPath = resolvedSource;
+                this._snapshotSkippedAtLoad = false;
                 const seen = new Set<string>();
                 const { read, skipped } = await copyDiskToMemoryIncremental(
                     this.fs, this.realDir, this.dir, matcher, '', this._diskSnapshot, seen,
@@ -441,19 +467,21 @@ export class MemoryGit {
                     respectGitignore,
                     nestedGitignore,
                     explicitIgnore,
-                    incremental: true,
                 }, { success: true, filesLoaded: fileCount, read, skipped, removed });
             } else {
                 fileCount = await copyDiskToMemory(this.fs, this.realDir, this.dir, matcher, '');
-                // Full reload invalidates the snapshot — we no longer know which subset of
-                // memfs maps cleanly to disk fingerprints.
+                // Caller opted out of the snapshot — invalidate any prior one
+                // and remember the opt-out so the next flush can warn instead
+                // of silently doing a full rewrite.
                 this._diskSnapshot.clear();
                 this._snapshotPath = null;
+                this._snapshotSkippedAtLoad = this._tracksDiskSnapshot;
                 this._logOperation('loadFromDisk', {
                     sourcePath: this.realDir,
                     respectGitignore,
                     nestedGitignore,
                     explicitIgnore,
+                    skipSnapshot: true,
                 }, { success: true, filesLoaded: fileCount });
             }
 
@@ -1495,18 +1523,46 @@ export class MemoryGit {
                 await fsRealAsync.mkdir(destination, { recursive: true });
             }
 
-            const incremental = options.incremental === true;
             const clean = options.clean === true;
+            // Incremental is opt-out as of 3.4. `{force:true}` forces a full
+            // rewrite. The instance toggle `tracksDiskSnapshot:false` also
+            // forces full rewrites, but silently — that's the user telling us
+            // they don't want snapshot bookkeeping at all on this instance.
+            const explicitForce = options.force === true;
+            const forceFull = explicitForce || !this._tracksDiskSnapshot;
 
-            if (!incremental) {
+            // If the user skipped the snapshot at load time and didn't ask for
+            // a force here, warn that we're falling back to a full rewrite —
+            // this is the foot-gun the new default is meant to remove. The
+            // warning only fires when (a) tracksDiskSnapshot is on, so the
+            // user reasonably expected incremental, and (b) the snapshot is
+            // empty *because* of skipSnapshot, not because of a fresh init.
+            const fallbackToFull =
+                !forceFull &&
+                this._tracksDiskSnapshot &&
+                this._snapshotSkippedAtLoad &&
+                this._diskSnapshot.size === 0;
+
+            if (fallbackToFull) {
+                console.warn(
+                    '[memory-git] flush(): no disk snapshot is available (loadFromDisk ran with ' +
+                    'skipSnapshot), falling back to a full rewrite. Pass {force:true} to silence ' +
+                    'this warning, or drop skipSnapshot from loadFromDisk to enable incremental flush.',
+                );
+            }
+
+            if (forceFull || fallbackToFull) {
                 const fileCount = await copyMemoryToDisk(this.fs, this.dir, destination);
                 // A full flush bypasses the snapshot; subsequent incremental flushes
                 // would have a stale baseline, so invalidate it.
                 this._diskSnapshot.clear();
                 this._snapshotPath = null;
+                this._snapshotSkippedAtLoad = false;
                 this._logOperation('flush', { targetPath: destination, options }, {
                     success: true,
                     filesFlushed: fileCount,
+                    fullRewrite: true,
+                    fallbackToFull,
                 });
                 return fileCount;
             }
@@ -1949,6 +2005,7 @@ export class MemoryGit {
             this._dirtyFiles.clear();
             this._diskSnapshot.clear();
             this._snapshotPath = null;
+            this._snapshotSkippedAtLoad = false;
             this._logOperation('clear', {}, { success: true });
             return true;
         } catch (error) {

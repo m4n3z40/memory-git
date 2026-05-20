@@ -1094,6 +1094,137 @@ describe('MemoryGit', () => {
         });
     });
 
+    describe('Snapshot defaults (3.4 opt-out behaviour)', () => {
+        const srcDir = '/tmp/memory-git-defaults-src';
+        const dstDir = '/tmp/memory-git-defaults-dst';
+
+        beforeEach(async () => {
+            await fs.rm(srcDir, { recursive: true, force: true });
+            await fs.rm(dstDir, { recursive: true, force: true });
+            await fs.mkdir(srcDir, { recursive: true });
+            await fs.mkdir(path.join(srcDir, 'src'), { recursive: true });
+            await fs.writeFile(path.join(srcDir, 'README.md'), '# v1');
+            await fs.writeFile(path.join(srcDir, 'src/a.js'), 'a');
+            await fs.writeFile(path.join(srcDir, 'src/b.js'), 'b');
+        });
+
+        afterEach(async () => {
+            await fs.rm(srcDir, { recursive: true, force: true });
+            await fs.rm(dstDir, { recursive: true, force: true });
+        });
+
+        it('loadFromDisk() with no opts builds the snapshot and flush() is incremental', async () => {
+            await memGit.loadFromDisk(srcDir);
+            await memGit.flush(dstDir);
+            const log1 = memGit.getOperationsLog();
+            const op1 = log1[log1.length - 1].result as { written: number; skipped: number };
+            expect(op1.written).toBeGreaterThan(0);
+
+            // Second flush with no in-memory changes: snapshot recognizes everything is up-to-date.
+            await memGit.flush(dstDir);
+            const log2 = memGit.getOperationsLog();
+            const op2 = log2[log2.length - 1].result as { written: number; skipped: number };
+            expect(op2.written).toBe(0);
+            expect(op2.skipped).toBeGreaterThan(0);
+        });
+
+        it('skipSnapshot:true does not build a snapshot', async () => {
+            await memGit.loadFromDisk(srcDir, { skipSnapshot: true });
+            const log = memGit.getOperationsLog();
+            const loadEntry = log[log.length - 1];
+            // The skipSnapshot branch logs only filesLoaded, no read/skipped/removed.
+            expect((loadEntry.result as Record<string, unknown>).filesLoaded).toBeGreaterThan(0);
+            expect((loadEntry.result as Record<string, unknown>).read).toBeUndefined();
+            expect((loadEntry.params as Record<string, unknown>).skipSnapshot).toBe(true);
+        });
+
+        it('flush after skipSnapshot warns and falls back to a full rewrite', async () => {
+            const warnings: string[] = [];
+            const original = console.warn;
+            console.warn = (msg: string) => { warnings.push(msg); };
+            try {
+                await memGit.loadFromDisk(srcDir, { skipSnapshot: true });
+                await memGit.flush(dstDir);
+
+                expect(warnings.length).toBe(1);
+                expect(warnings[0]).toContain('skipSnapshot');
+                expect(warnings[0]).toContain('full rewrite');
+
+                const log = memGit.getOperationsLog();
+                const op = log[log.length - 1].result as { fullRewrite: boolean; fallbackToFull: boolean };
+                expect(op.fullRewrite).toBe(true);
+                expect(op.fallbackToFull).toBe(true);
+
+                // Files actually landed on disk.
+                expect(await fs.readFile(path.join(dstDir, 'README.md'), 'utf8')).toBe('# v1');
+            } finally {
+                console.warn = original;
+            }
+        });
+
+        it('flush({force:true}) silences the warning and forces full rewrite', async () => {
+            const warnings: string[] = [];
+            const original = console.warn;
+            console.warn = (msg: string) => { warnings.push(msg); };
+            try {
+                await memGit.loadFromDisk(srcDir, { skipSnapshot: true });
+                await memGit.flush(dstDir, { force: true });
+
+                expect(warnings).toEqual([]);
+                const log = memGit.getOperationsLog();
+                const op = log[log.length - 1].result as { fullRewrite: boolean; fallbackToFull: boolean };
+                expect(op.fullRewrite).toBe(true);
+                expect(op.fallbackToFull).toBe(false);
+            } finally {
+                console.warn = original;
+            }
+        });
+
+        it('tracksDiskSnapshot:false silently does full rewrites with no warning', async () => {
+            const mg = new MemoryGit('no-snapshot', { tracksDiskSnapshot: false });
+            const warnings: string[] = [];
+            const original = console.warn;
+            console.warn = (msg: string) => { warnings.push(msg); };
+            try {
+                await mg.loadFromDisk(srcDir);
+                await mg.flush(dstDir);
+                expect(warnings).toEqual([]);
+
+                const log = mg.getOperationsLog();
+                const op = log[log.length - 1].result as { fullRewrite: boolean; fallbackToFull: boolean };
+                expect(op.fullRewrite).toBe(true);
+                expect(op.fallbackToFull).toBe(false);
+            } finally {
+                console.warn = original;
+            }
+        });
+
+        it('legacy {incremental:true} on load + flush still works as an alias', async () => {
+            await memGit.loadFromDisk(srcDir, { incremental: true });
+            await memGit.flush(dstDir, { incremental: true });
+            await memGit.flush(dstDir, { incremental: true });
+            const log = memGit.getOperationsLog();
+            const op = log[log.length - 1].result as { written: number; skipped: number };
+            expect(op.written).toBe(0);
+            expect(op.skipped).toBeGreaterThan(0);
+        });
+
+        it('first flush after init() + writeFile() does not warn (empty snapshot is expected)', async () => {
+            const warnings: string[] = [];
+            const original = console.warn;
+            console.warn = (msg: string) => { warnings.push(msg); };
+            try {
+                await memGit.init();
+                await memGit.writeFile('hello.txt', 'world');
+                await memGit.flush(dstDir);
+                expect(warnings).toEqual([]);
+                expect(await fs.readFile(path.join(dstDir, 'hello.txt'), 'utf8')).toBe('world');
+            } finally {
+                console.warn = original;
+            }
+        });
+    });
+
     describe('Parameter Sanitization in Log', () => {
         it('should truncate large content in log', async () => {
             await memGit.init();
