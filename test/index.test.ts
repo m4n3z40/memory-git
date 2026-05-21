@@ -93,6 +93,39 @@ describe('MemoryGit', () => {
             it('should throw error for nonexistent file', async () => {
                 await expect(memGit.readFile('nonexistent.txt')).rejects.toThrow();
             });
+
+            it('should return string when encoding is utf-8', async () => {
+                await memGit.writeFile('foo.txt', 'hello');
+                const content = await memGit.readFile('foo.txt', { encoding: 'utf-8' });
+                expect(typeof content).toBe('string');
+                expect(content).toBe('hello');
+            });
+
+            it('should return string when encoding is utf8', async () => {
+                await memGit.writeFile('foo.txt', 'hello');
+                const content = await memGit.readFile('foo.txt', { encoding: 'utf8' });
+                expect(content).toBe('hello');
+            });
+
+            it('should return Buffer when encoding is null', async () => {
+                const original = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0xfe]);
+                await memGit.writeFile('img.png', original);
+                const buf = await memGit.readFile('img.png', { encoding: null });
+                expect(Buffer.isBuffer(buf)).toBe(true);
+                expect(Buffer.compare(buf, original)).toBe(0);
+            });
+
+            it('should roundtrip Buffer bytes without lossy utf-8 substitution', async () => {
+                const original = Buffer.from([0xc3, 0x28, 0xa0, 0xa1, 0xff, 0xfe]);
+                await memGit.writeFile('binary.dat', original);
+                const buf = await memGit.readFile('binary.dat', { encoding: null });
+                expect(buf.length).toBe(original.length);
+                expect(Buffer.compare(buf, original)).toBe(0);
+            });
+
+            it('should reject ENOENT for buffer reads (not return null/empty)', async () => {
+                await expect(memGit.readFile('missing.bin', { encoding: null })).rejects.toThrow();
+            });
         });
 
         describe('fileExists', () => {

@@ -547,11 +547,25 @@ export class MemoryGit {
     /**
      * Reads a file from the in-memory repository
      * @param filepath - Relative file path
-     * @returns File content
+     * @param options - Encoding. Default utf-8 returns string; `{ encoding: null }` returns Buffer
+     * @returns File content as string (default) or Buffer for binary reads
      */
-    async readFile(filepath: string): Promise<string> {
+    async readFile(filepath: string): Promise<string>;
+    async readFile(filepath: string, options: { encoding: 'utf-8' | 'utf8' }): Promise<string>;
+    async readFile(filepath: string, options: { encoding: null } | null): Promise<Buffer>;
+    async readFile(
+        filepath: string,
+        options?: { encoding: 'utf-8' | 'utf8' | null } | null,
+    ): Promise<string | Buffer> {
         try {
             const fullPath = pathNode.posix.join(this.dir, filepath);
+            const encoding = options === null ? null : options?.encoding;
+            const wantsBuffer = encoding === null;
+            if (wantsBuffer) {
+                const buf = this.fs.readFileSync(fullPath) as Buffer;
+                this._logOperation('readFile', { filepath }, { success: true, size: buf.length });
+                return buf;
+            }
             const content = this.fs.readFileSync(fullPath, 'utf8') as string;
             this._logOperation('readFile', { filepath }, { success: true, size: content.length });
             return content;

@@ -148,7 +148,7 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | Method | Description |
 |--------|-------------|
 | `writeFile(filepath, content)` | Writes file |
-| `readFile(filepath)` | Reads file |
+| `readFile(filepath, options?)` | Reads file. Default utf-8 → string; `{encoding: null}` → Buffer (binary-safe) |
 | `deleteFile(filepath)` | Deletes file |
 | `fileExists(filepath)` | Checks existence |
 | `listFiles(dir?, includeGit?)` | Lists files in working tree |
