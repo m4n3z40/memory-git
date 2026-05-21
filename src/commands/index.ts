@@ -33,6 +33,8 @@ import stash from './stash.js';
 import revParse from './rev-parse.js';
 import lsFiles from './ls-files.js';
 import revList from './rev-list.js';
+import showRef from './show-ref.js';
+import describe from './describe.js';
 
 const REGISTRY = new Map<string, Command>();
 function register(cmd: Command): void {
@@ -63,6 +65,8 @@ register(stash);
 register(revParse);
 register(lsFiles);
 register(revList);
+register(showRef);
+register(describe);
 
 /** Resolve a subcommand by name (or alias). Returns `undefined` if unknown. */
 export function getCommand(name: string): Command | undefined {

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs/promises';
 import path from 'path';
-import { MemoryGit } from './index';
+import { MemoryGit } from '../src/index';
 
 describe('MemoryGit', () => {
     let memGit: MemoryGit;

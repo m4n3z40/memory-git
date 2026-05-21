@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { MemoryGit } from '../index';
-import { MemfsBackedFs, toJustBashFs, type FsWriteOp } from './just-bash';
+import { MemoryGit } from '../../src/index';
+import { MemfsBackedFs, toJustBashFs, type FsWriteOp } from '../../src/adapters/just-bash';
 
 describe('MemoryGit v3.1 additions', () => {
     let mg: MemoryGit;

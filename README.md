@@ -91,6 +91,8 @@ await mg.exec('git config user.name "Agent"');
 | `checkout` | `<ref>`, `-b <new>`, `-f`, `-- <files...>` |
 | `merge` | `<branch>`, `--no-ff`, `--ff-only`, `-m <msg>` |
 | `tag` | `<name>`, `-a -m <msg>`, `-d <name>`, `-f`, `-l` |
+| `show-ref` | `--tags`, `-d/--dereference` |
+| `describe` | `--exact-match --tags <ref>` |
 | `reset` | `--soft`, `--mixed`, `--hard`, `<ref>`, `-- <files...>` |
 | `clone` | `<url>`, `-b/--branch <ref>`, `--depth <n>`, `--single-branch`, `--no-checkout` |
 | `fetch` | `[<remote>]`, `--prune`, `--tags`, `--depth <n>` |
