@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs/promises';
+import * as nodeFs from 'fs';
 import path from 'path';
 import { MemoryGit } from '../src/index';
 
@@ -1221,6 +1222,135 @@ describe('MemoryGit', () => {
                 expect(await fs.readFile(path.join(dstDir, 'hello.txt'), 'utf8')).toBe('world');
             } finally {
                 console.warn = original;
+            }
+        });
+    });
+
+    describe('Immutable loose-object protection (3.5.1)', () => {
+        // Regression: flush() used to attempt writes into .git/objects/XX/YY
+        // files that real git keeps at mode 0444, racing into EACCES. The fix
+        // short-circuits writes to content-addressed paths that already exist.
+        const sourceDir = '/tmp/memory-git-immutable-src';
+
+        async function walkLooseObjects(root: string): Promise<string[]> {
+            const objectsDir = path.join(root, '.git', 'objects');
+            const out: string[] = [];
+            let entries: import('fs').Dirent[];
+            try {
+                entries = await fs.readdir(objectsDir, { withFileTypes: true });
+            } catch {
+                return out;
+            }
+            for (const entry of entries) {
+                if (!entry.isDirectory()) continue;
+                if (!/^[0-9a-f]{2}$/.test(entry.name)) continue;
+                const sub = path.join(objectsDir, entry.name);
+                for (const f of await fs.readdir(sub)) out.push(path.join(sub, f));
+            }
+            return out;
+        }
+
+        async function setMode(paths: string[], mode: number) {
+            for (const p of paths) {
+                try { await fs.chmod(p, mode); } catch { /* ignore */ }
+            }
+        }
+
+        beforeEach(async () => {
+            await fs.rm(sourceDir, { recursive: true, force: true });
+            await fs.mkdir(sourceDir, { recursive: true });
+
+            // Bootstrap a populated git repo on disk via memGit itself so the
+            // test has no dependency on the system `git` binary.
+            const bootstrap = new MemoryGit('bootstrap-immutable');
+            await bootstrap.init();
+            bootstrap.setAuthor('Test', 'test@example.com');
+            await bootstrap.writeFile('README.md', '# Test Project');
+            await bootstrap.writeFile('src/index.js', 'console.log("hello");');
+            await bootstrap.add('.');
+            await bootstrap.commit('initial commit');
+            await bootstrap.flush(sourceDir);
+
+            // Real git chmods loose objects to 0444 — replicate that so a
+            // re-write would fail with EACCES on this filesystem.
+            await setMode(await walkLooseObjects(sourceDir), 0o444);
+        });
+
+        afterEach(async () => {
+            // Restore writability so the test runner can clean up.
+            await setMode(await walkLooseObjects(sourceDir), 0o644);
+            await fs.rm(sourceDir, { recursive: true, force: true });
+        });
+
+        it('noop flush after loadFromDisk does not error and does not write any pre-existing immutable object', async () => {
+            const preExisting = new Set(await walkLooseObjects(sourceDir));
+            expect(preExisting.size).toBeGreaterThan(0);
+
+            const mg = new MemoryGit('immutable-noop');
+            await mg.loadFromDisk(sourceDir, { respectGitignore: true });
+
+            const writeSpy = vi.spyOn(nodeFs.promises, 'writeFile');
+            try {
+                await expect(mg.flush(sourceDir)).resolves.toBeDefined();
+
+                for (const call of writeSpy.mock.calls) {
+                    const target = String(call[0]);
+                    expect(preExisting.has(target)).toBe(false);
+                }
+            } finally {
+                writeSpy.mockRestore();
+            }
+        });
+
+        it('flush with one new commit writes only the new object; pre-existing 0444 objects are left untouched', async () => {
+            const preExisting = new Set(await walkLooseObjects(sourceDir));
+
+            const mg = new MemoryGit('immutable-new-commit');
+            mg.setAuthor('Test', 'test@example.com');
+            await mg.loadFromDisk(sourceDir, { respectGitignore: true });
+
+            await mg.writeFile('extra.txt', 'a brand new file');
+            await mg.add('.');
+            const newCommitSha = await mg.commit('add extra');
+            expect(newCommitSha).toMatch(/^[0-9a-f]{40}$/);
+
+            const writeSpy = vi.spyOn(nodeFs.promises, 'writeFile');
+            try {
+                await expect(mg.flush(sourceDir)).resolves.toBeDefined();
+
+                for (const call of writeSpy.mock.calls) {
+                    const target = String(call[0]);
+                    expect(preExisting.has(target)).toBe(false);
+                }
+            } finally {
+                writeSpy.mockRestore();
+            }
+
+            const newCommitPath = path.join(
+                sourceDir, '.git', 'objects',
+                newCommitSha.slice(0, 2),
+                newCommitSha.slice(2),
+            );
+            expect(await fs.access(newCommitPath).then(() => true, () => false)).toBe(true);
+        });
+
+        it('force-flush (full rewrite) also skips writes to pre-existing immutable objects', async () => {
+            const preExisting = new Set(await walkLooseObjects(sourceDir));
+            expect(preExisting.size).toBeGreaterThan(0);
+
+            const mg = new MemoryGit('immutable-force');
+            await mg.loadFromDisk(sourceDir, { respectGitignore: true });
+
+            const writeSpy = vi.spyOn(nodeFs.promises, 'writeFile');
+            try {
+                await expect(mg.flush(sourceDir, { force: true })).resolves.toBeDefined();
+
+                for (const call of writeSpy.mock.calls) {
+                    const target = String(call[0]);
+                    expect(preExisting.has(target)).toBe(false);
+                }
+            } finally {
+                writeSpy.mockRestore();
             }
         });
     });

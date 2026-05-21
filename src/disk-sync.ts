@@ -37,6 +37,24 @@ export function hashBuffer(buf: Buffer): string {
     return createHash('sha1').update(buf).digest('hex');
 }
 
+/**
+ * Paths whose content is fully determined by the filename. Real git keeps
+ * these at mode 0444, so any flush that re-writes them races into EACCES.
+ *
+ * Matches:
+ *   - loose objects:   .git/objects/<2 hex>/<remaining hex>
+ *   - packed objects:  .git/objects/pack/pack-<hex>.{pack,idx,rev,mtimes,bitmap}
+ *
+ * The repo root prefix (`.git/`) is matched against the repo-relative form,
+ * so this works for both the top-level walk and nested recursion.
+ */
+const IMMUTABLE_OBJECT_RE =
+    /^\.git\/objects\/(?:[0-9a-f]{2}\/[0-9a-f]+|pack\/pack-[0-9a-f]+\.(?:pack|idx|rev|mtimes|bitmap))$/;
+
+export function isImmutableObjectPath(relPath: string): boolean {
+    return IMMUTABLE_OBJECT_RE.test(relPath);
+}
+
 /** Cheap existence probe — `access` is the smallest "does it exist" call. */
 export async function realPathExists(filepath: string): Promise<boolean> {
     try {
@@ -152,17 +170,22 @@ export async function copyDiskToMemory(
 /**
  * Copy an in-memory subtree to real disk. Returns the file count. Subtree
  * writes run in parallel; missing directories are mkdir -p'd on demand.
+ *
+ * Skips writes to content-addressed git object paths that already exist on
+ * disk — those files are immutable (0444) and writing them would EACCES.
  */
 export async function copyMemoryToDisk(
     fs: MemFs,
     memoryPath: string,
     realPath: string,
+    relPath: string = '',
 ): Promise<number> {
     const entries = fs.readdirSync(memoryPath) as string[];
 
     const promises = entries.map(async (entry) => {
         const memoryEntryPath = pathNode.posix.join(memoryPath, entry);
         const realEntryPath = pathNode.join(realPath, entry);
+        const entryRel = relPath ? pathNode.posix.join(relPath, entry) : entry;
 
         const stat = fs.statSync(memoryEntryPath);
 
@@ -171,8 +194,11 @@ export async function copyMemoryToDisk(
             if (!dirExists) {
                 await fsRealAsync.mkdir(realEntryPath, { recursive: true });
             }
-            return await copyMemoryToDisk(fs, memoryEntryPath, realEntryPath);
+            return await copyMemoryToDisk(fs, memoryEntryPath, realEntryPath, entryRel);
         } else {
+            if (isImmutableObjectPath(entryRel) && await realPathExists(realEntryPath)) {
+                return 0;
+            }
             const content = fs.readFileSync(memoryEntryPath);
             await fsRealAsync.writeFile(realEntryPath, content);
             return 1;
@@ -293,6 +319,18 @@ export async function copyMemoryToDiskIncremental(
         }
 
         seen.add(entryRel);
+
+        // Content-addressed git objects (.git/objects/XX/YY and pack-*.{pack,idx,…})
+        // are immutable. Real git keeps them at mode 0444, so re-writing them
+        // races into EACCES; the path IS the content hash, so existence on
+        // disk implies the bytes are already correct. Short-circuit BEFORE
+        // touching the snapshot so the skip holds even if the snapshot lacks
+        // this path or is stale (e.g. memfs got a re-compressed copy from a
+        // subsequent git.add()).
+        if (isImmutableObjectPath(entryRel) && await realPathExists(realEntryPath)) {
+            return { written: 0, skipped: 1 };
+        }
+
         const content = fs.readFileSync(memoryEntryPath) as Buffer;
         const size = content.length;
         const prior = snapshot.get(entryRel);
