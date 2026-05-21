@@ -69,18 +69,18 @@
   "packageManager": "pnpm@11.1.1",
   "dependencies": {
     "ignore": "^7.0.5",
-    "isomorphic-git": "^1.37.6",
+    "isomorphic-git": "^1.38.1",
     "memfs": "^4.57.2",
     "mri": "^1.2.0",
     "shell-quote": "^1.8.3"
   },
   "devDependencies": {
-    "@types/node": "^25.7.0",
+    "@types/node": "^25.9.1",
     "@types/shell-quote": "^1.7.5",
-    "@vitest/coverage-v8": "4.1.6",
-    "just-bash": "^3.0.0",
+    "@vitest/coverage-v8": "^4.1.7",
+    "just-bash": "^3.0.1",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.6"
+    "vitest": "^4.1.7"
   },
   "peerDependencies": {
     "just-bash": ">=3.0.0"
