@@ -213,8 +213,13 @@ export interface RenameOptions {
 }
 
 export interface FetchOptions {
-    /** Remote name */
+    /** Remote name (looked up in git config). Mutually exclusive with `url`. */
     remote?: string;
+    /**
+     * Direct remote URL — bypasses config and fetches ad-hoc, matching
+     * `git fetch <url>`. Takes precedence over `remote` if both are set.
+     */
+    url?: string;
     /** Prune remote-tracking refs that no longer exist on remote */
     prune?: boolean;
     /** Fetch all tags */
@@ -230,8 +235,13 @@ export interface FetchOptions {
 }
 
 export interface PullOptions {
-    /** Remote name */
+    /** Remote name. Mutually exclusive with `url`. */
     remote?: string;
+    /**
+     * Direct remote URL — bypasses config and pulls ad-hoc, matching
+     * `git pull <url> <branch>`. Takes precedence over `remote` if both are set.
+     */
+    url?: string;
     /** Branch to pull */
     branch?: string;
     /** Refuse to merge unless fast-forward is possible (--ff-only) */
@@ -243,8 +253,13 @@ export interface PullOptions {
 }
 
 export interface PushOptions {
-    /** Remote name (default: 'origin') */
+    /** Remote name (default: 'origin'). Mutually exclusive with `url`. */
     remote?: string;
+    /**
+     * Direct remote URL — bypasses config and pushes ad-hoc, matching
+     * `git push <url>`. Takes precedence over `remote` if both are set.
+     */
+    url?: string;
     /** Ref to push (default: current branch) */
     ref?: string;
     /** Remote ref name */

@@ -2127,26 +2127,38 @@ export class MemoryGit {
     async fetch(remoteOrOptions: string | FetchOptions = 'origin'): Promise<boolean> {
         this._assertWritable('fetch');
         const options: FetchOptions =
-            typeof remoteOrOptions === 'string' ? { remote: remoteOrOptions } : remoteOrOptions;
-        const remote = options.remote ?? 'origin';
+            typeof remoteOrOptions === 'string'
+                ? (this._looksLikeUrl(remoteOrOptions)
+                    ? { url: remoteOrOptions }
+                    : { remote: remoteOrOptions })
+                : remoteOrOptions;
+        const remoteName = options.remote ?? 'origin';
+        const useUrl = options.url ? { url: options.url, remote: remoteName } : { remote: remoteName };
 
         try {
             this._checkSignal(options.signal);
+            // isomorphic-git always updates remote-tracking refs after a
+            // fetch, and that pass needs `remote.<name>.fetch` to exist. When
+            // we're fetching ad-hoc by URL the user hasn't configured one, so
+            // seed the standard default refspec to match `git fetch <url>`.
+            if (options.url) {
+                await this._ensureDefaultFetchRefspec(remoteName);
+            }
             await this._withSignal(git.fetch({
                 fs: this.fs,
                 http,
                 dir: this.dir,
-                remote,
+                ...useUrl,
                 prune: options.prune,
                 tags: options.tags,
                 depth: options.depth,
                 singleBranch: options.singleBranch,
                 ref: options.ref
             }), options.signal);
-            this._logOperation('fetch', { remote, options }, { success: true });
+            this._logOperation('fetch', { ...useUrl, options }, { success: true });
             return true;
         } catch (error) {
-            this._logOperation('fetch', { remote, options }, null, error as Error);
+            this._logOperation('fetch', { ...useUrl, options }, null, error as Error);
             throw error;
         }
     }
@@ -2163,29 +2175,35 @@ export class MemoryGit {
         this._assertWritable('pull');
         const options: PullOptions =
             typeof remoteOrOptions === 'string'
-                ? { remote: remoteOrOptions, branch: branch ?? undefined }
+                ? (this._looksLikeUrl(remoteOrOptions)
+                    ? { url: remoteOrOptions, branch: branch ?? undefined }
+                    : { remote: remoteOrOptions, branch: branch ?? undefined })
                 : remoteOrOptions;
-        const remote = options.remote ?? 'origin';
+        const remoteName = options.remote ?? 'origin';
+        const useUrl = options.url ? { url: options.url, remote: remoteName } : { remote: remoteName };
 
         try {
             this._checkSignal(options.signal);
             const currentBranchName = options.branch || await this.currentBranch();
+            if (options.url) {
+                await this._ensureDefaultFetchRefspec(remoteName);
+            }
 
             await this._withSignal(git.pull({
                 fs: this.fs,
                 http,
                 dir: this.dir,
-                remote,
+                ...useUrl,
                 ref: currentBranchName,
                 author: this.author,
                 fastForward: options.fastForward,
                 fastForwardOnly: options.fastForwardOnly
             }), options.signal);
 
-            this._logOperation('pull', { remote, branch: currentBranchName, options }, { success: true });
+            this._logOperation('pull', { ...useUrl, branch: currentBranchName, options }, { success: true });
             return true;
         } catch (error) {
-            this._logOperation('pull', { remote, branch, options }, null, error as Error);
+            this._logOperation('pull', { ...useUrl, branch, options }, null, error as Error);
             throw error;
         }
     }
@@ -2203,9 +2221,11 @@ export class MemoryGit {
         this._assertWritable('push');
         const options: PushOptions =
             typeof remoteOrOptions === 'string'
-                ? { remote: remoteOrOptions, ref }
+                ? (this._looksLikeUrl(remoteOrOptions)
+                    ? { url: remoteOrOptions, ref }
+                    : { remote: remoteOrOptions, ref })
                 : remoteOrOptions;
-        const remote = options.remote ?? 'origin';
+        const useUrl = options.url ? { url: options.url } : { remote: options.remote ?? 'origin' };
 
         try {
             this._checkSignal(options.signal);
@@ -2213,17 +2233,53 @@ export class MemoryGit {
                 fs: this.fs,
                 http,
                 dir: this.dir,
-                remote,
+                ...useUrl,
                 ref: options.ref,
                 remoteRef: options.remoteRef,
                 force: options.force,
                 delete: options.delete
             }), options.signal);
-            this._logOperation('push', { remote, options }, { success: true });
+            this._logOperation('push', { ...useUrl, options }, { success: true });
             return result;
         } catch (error) {
-            this._logOperation('push', { remote, options }, null, error as Error);
+            this._logOperation('push', { ...useUrl, options }, null, error as Error);
             throw error;
+        }
+    }
+
+    /**
+     * Heuristic: does the string look like a remote URL (vs a configured
+     * remote name)? Matches the common forms accepted by `git fetch`/`git push`:
+     * https://, http://, git://, ssh://, file:// schemes, and the SSH
+     * shorthand `user@host:path`. Plain identifiers like `origin` return false.
+     * @private
+     */
+    private _looksLikeUrl(s: string): boolean {
+        return /^(https?|git|ssh|file):\/\//.test(s) || /^[^/@\s]+@[^:]+:/.test(s);
+    }
+
+    /**
+     * Writes the standard `+refs/heads/*:refs/remotes/<name>/*` fetch
+     * refspec for a remote if none is configured. isomorphic-git refuses
+     * to update remote-tracking refs without one, but `git fetch <url>`
+     * has no opportunity to configure one beforehand, so we seed it.
+     * @private
+     */
+    private async _ensureDefaultFetchRefspec(remoteName: string): Promise<void> {
+        try {
+            const existing = await git.getConfigAll({
+                fs: this.fs, dir: this.dir, path: `remote.${remoteName}.fetch`,
+            });
+            if (existing.length === 0) {
+                await git.setConfig({
+                    fs: this.fs, dir: this.dir,
+                    path: `remote.${remoteName}.fetch`,
+                    value: `+refs/heads/*:refs/remotes/${remoteName}/*`,
+                });
+            }
+        } catch {
+            // Best-effort: if config writes fail the fetch will throw with a
+            // clearer error than anything we could rephrase here.
         }
     }
 
