@@ -331,18 +331,84 @@ export class MemoryGit {
     }
 
     /**
-     * Resolves a ref or short OID to a full OID. Accepts symbolic refs (HEAD, branch, tag) or hex hashes.
+     * Resolves a ref or short OID to a full OID. Accepts symbolic refs
+     * (HEAD, branch, tag), hex hashes, and the git revision-suffix syntax
+     * (`~`, `~N`, `^`, `^N`, chained — e.g. `HEAD~2`, `main^`, `HEAD~2^3`).
+     * isomorphic-git's `resolveRef` doesn't understand the suffixes, so we
+     * strip them, resolve the base, then walk parents via `readCommit`.
      * @private
      */
     private async _resolveAny(ref: string): Promise<string> {
+        const { base, ops } = this._parseRevSuffix(ref);
+        if (!base) throw new Error(`fatal: bad revision '${ref}'`);
+        let oid: string;
         try {
-            return await git.resolveRef({ fs: this.fs, dir: this.dir, ref });
+            oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: base });
         } catch (e) {
-            if (/^[0-9a-f]{4,40}$/i.test(ref)) {
-                return await git.expandOid({ fs: this.fs, dir: this.dir, oid: ref });
+            if (/^[0-9a-f]{4,40}$/i.test(base)) {
+                oid = await git.expandOid({ fs: this.fs, dir: this.dir, oid: base });
+            } else {
+                // Preserve the original git CLI error shape — callers (and tests)
+                // grep for "Could not find <ref>" / "bad revision <ref>".
+                throw e;
             }
-            throw e;
         }
+        return ops.length > 0 ? this._walkRevSuffix(oid, ops, ref) : oid;
+    }
+
+    /**
+     * Splits a ref like `HEAD~2^3` into `{ base: 'HEAD', ops: [~2, ^3] }`.
+     * Trailing `~` / `^` without a number is treated as `~1` / `^1`, matching
+     * git CLI. Refs without a suffix come back as `{ base: ref, ops: [] }`.
+     * @private
+     */
+    private _parseRevSuffix(ref: string): { base: string; ops: Array<{ type: '~' | '^'; n: number }> } {
+        const ops: Array<{ type: '~' | '^'; n: number }> = [];
+        let i = ref.length;
+        while (i > 0) {
+            let j = i - 1;
+            while (j >= 0 && ref[j] >= '0' && ref[j] <= '9') j--;
+            if (j < 0 || (ref[j] !== '~' && ref[j] !== '^')) break;
+            const numStr = ref.slice(j + 1, i);
+            const type = ref[j] as '~' | '^';
+            const n = numStr === '' ? 1 : Number(numStr);
+            ops.unshift({ type, n });
+            i = j;
+        }
+        return { base: ref.slice(0, i), ops };
+    }
+
+    /**
+     * Walks revision-suffix operations from a starting OID.
+     * `~N` follows the first-parent chain N hops; `^N` picks the Nth parent
+     * of the current commit (with `^0` meaning the commit itself).
+     * @private
+     */
+    private async _walkRevSuffix(
+        oid: string,
+        ops: Array<{ type: '~' | '^'; n: number }>,
+        originalRef: string,
+    ): Promise<string> {
+        let cur = oid;
+        for (const op of ops) {
+            if (op.type === '~') {
+                for (let k = 0; k < op.n; k++) {
+                    const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur });
+                    if (!commit.parent || commit.parent.length === 0) {
+                        throw new Error(`fatal: ambiguous argument '${originalRef}': unknown revision (walked past root)`);
+                    }
+                    cur = commit.parent[0];
+                }
+            } else {
+                if (op.n === 0) continue;
+                const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur });
+                if (!commit.parent || op.n > commit.parent.length) {
+                    throw new Error(`fatal: ambiguous argument '${originalRef}': commit has no parent ${op.n}`);
+                }
+                cur = commit.parent[op.n - 1];
+            }
+        }
+        return cur;
     }
 
     /**
@@ -859,7 +925,8 @@ export class MemoryGit {
         const ref = options.ref ?? 'HEAD';
 
         try {
-            const commits = await git.log({ fs: this.fs, dir: this.dir, depth, ref });
+            const resolvedRef = await this._resolveAny(ref);
+            const commits = await git.log({ fs: this.fs, dir: this.dir, depth, ref: resolvedRef });
 
             const sinceMs = options.since instanceof Date ? options.since.getTime() :
                             typeof options.since === 'number' ? options.since : undefined;
@@ -1044,7 +1111,7 @@ export class MemoryGit {
         let theirsOid: string | undefined;
         try {
             oursOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: 'HEAD' });
-            theirsOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: theirBranch });
+            theirsOid = await this._resolveAny(theirBranch);
             // Record pre-merge HEAD so abortMerge() / `reset --merge` can recover.
             // git CLI writes ORIG_HEAD unconditionally before the merge starts.
             this._writeGitStateFile('ORIG_HEAD', `${oursOid}\n`);
@@ -1267,7 +1334,7 @@ export class MemoryGit {
                 this._logOperation('resolveRef', { ref, options }, { success: true, abbrev: stripped });
                 return stripped;
             }
-            const oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref });
+            const oid = await this._resolveAny(ref);
             const result = options?.short ? oid.slice(0, 7) : oid;
             this._logOperation('resolveRef', { ref, options }, { success: true, oid: result });
             return result;
@@ -1488,8 +1555,8 @@ export class MemoryGit {
         options?: { filter?: Array<'added' | 'modified' | 'deleted' | 'renamed'> }
     ): Promise<ChangedFile[]> {
         try {
-            const fromOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: fromRef });
-            const toOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: toRef });
+            const fromOid = await this._resolveAny(fromRef);
+            const toOid = await this._resolveAny(toRef);
 
             const changes: ChangedFile[] = [];
 
@@ -1601,10 +1668,11 @@ export class MemoryGit {
                     }
                 }
             } else {
+                const resolvedRef = await this._resolveAny(ref);
                 const commits = await git.log({
                     fs: this.fs,
                     dir: this.dir,
-                    ref,
+                    ref: resolvedRef,
                     depth: options?.maxCount
                 });
                 oids = commits.map(c => c.oid);
@@ -1860,7 +1928,7 @@ export class MemoryGit {
             const { blob } = await git.readBlob({
                 fs: this.fs,
                 dir: this.dir,
-                oid: await git.resolveRef({ fs: this.fs, dir: this.dir, ref }),
+                oid: await this._resolveAny(ref),
                 filepath
             });
 
