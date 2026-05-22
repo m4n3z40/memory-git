@@ -796,6 +796,58 @@ export class MemoryGit {
     }
 
     /**
+     * For every path that was touched via memory-git's API (writeFile,
+     * deleteFile, …) since the last commit/merge, compute the authoritative
+     * workdir status code (0 absent, 1 matches HEAD, 2 differs) by hashing
+     * the actual bytes. Returns an override map keyed by filepath.
+     *
+     * Bypasses isomorphic-git's stat-cache shortcut, which can report
+     * "unmodified" for same-size edits performed within the same
+     * filesystem-mtime second (common in fast in-memory flows).
+     */
+    private async _verifyDirtyWorkdir(): Promise<Map<string, number>> {
+        const overrides = new Map<string, number>();
+        if (this._dirtyFiles.size === 0) return overrides;
+        let headOid: string | null = null;
+        try {
+            headOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: 'HEAD' });
+        } catch {
+            return overrides; // pre-first-commit repo: nothing to compare against
+        }
+        for (const fp of this._dirtyFiles) {
+            const fullPath = pathNode.posix.join(this.dir, fp);
+            const exists = this.fs.existsSync(fullPath);
+            if (!exists) {
+                overrides.set(fp, 0);
+                continue;
+            }
+            try {
+                const bytes = this.fs.readFileSync(fullPath) as Buffer;
+                const { oid: workdirSha } = await git.hashBlob({ object: bytes });
+                const headBlob = await git.readBlob({
+                    fs: this.fs, dir: this.dir, oid: headOid, filepath: fp,
+                }).catch(() => null);
+                overrides.set(fp, headBlob && workdirSha === headBlob.oid ? 1 : 2);
+            } catch {
+                // Couldn't hash — leave statusMatrix's verdict alone.
+            }
+        }
+        return overrides;
+    }
+
+    /**
+     * Maps the verbose status strings produced by diff() to git's single-letter
+     * --diff-filter codes (A/D/M/R/...). Returns 'X' for anything unrecognized.
+     */
+    private _statusToFilterCode(status: string): string {
+        if (status.startsWith('added') || status.startsWith('new')) return 'A';
+        if (status.startsWith('deleted')) return 'D';
+        if (status.startsWith('modified')) return 'M';
+        if (status === 'renamed' || status.startsWith('renamed')) return 'R';
+        return 'X';
+    }
+
+    /**
      * Gets commit log
      * @param depthOrOptions - Number of commits (legacy) or LogOptions
      * @returns List of commits
@@ -988,7 +1040,15 @@ export class MemoryGit {
      */
     async merge(theirBranch: string, options: MergeOptions = {}): Promise<MergeResult> {
         this._assertWritable('merge');
+        let oursOid: string | undefined;
+        let theirsOid: string | undefined;
         try {
+            oursOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: 'HEAD' });
+            theirsOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: theirBranch });
+            // Record pre-merge HEAD so abortMerge() / `reset --merge` can recover.
+            // git CLI writes ORIG_HEAD unconditionally before the merge starts.
+            this._writeGitStateFile('ORIG_HEAD', `${oursOid}\n`);
+
             const result = await git.merge({
                 fs: this.fs,
                 dir: this.dir,
@@ -996,16 +1056,79 @@ export class MemoryGit {
                 author: this.author,
                 fastForward: options.noFastForward ? false : undefined,
                 fastForwardOnly: options.fastForwardOnly,
-                message: options.message
+                message: options.message,
+                allowUnrelatedHistories: options.allowUnrelatedHistories,
+                mergeDriver: options.strategy ? this._strategyMergeDriver(options.strategy) : undefined,
             });
-            // Merge rewrote workdir and index to the merge result
+            // isomorphic-git's merge moves HEAD but does not refresh the
+            // working tree (see its docs at merge.md). Force a checkout so
+            // workdir + index match the new commit, matching git CLI.
+            if (!result.alreadyMerged) {
+                await git.checkout({ fs: this.fs, dir: this.dir, ref: 'HEAD', force: true });
+            }
             this._dirtyFiles.clear();
+            this._clearMergeStateFiles();
 
             this._logOperation('merge', { theirBranch, options }, { success: true, ...result });
             return result;
         } catch (error) {
+            // Merge could not complete — leave MERGE_HEAD/MSG/MODE so the
+            // caller can `abortMerge()` (or inspect via `mg.exec("status")`).
+            if (oursOid && theirsOid) {
+                this._writeGitStateFile('MERGE_HEAD', `${theirsOid}\n`);
+                this._writeGitStateFile('MERGE_MSG', options.message ?? `Merge branch '${theirBranch}'\n`);
+                this._writeGitStateFile('MERGE_MODE', options.noFastForward ? 'no-ff\n' : '');
+            }
             this._logOperation('merge', { theirBranch, options }, null, error as Error);
             throw error;
+        }
+    }
+
+    /**
+     * Abort an in-progress merge, restoring the working tree to its pre-merge
+     * state (mirrors `git merge --abort`).
+     *
+     * Requires that `merge()` previously failed and left MERGE_HEAD behind.
+     * Throws if no merge is in progress.
+     */
+    async abortMerge(): Promise<void> {
+        this._assertWritable('abortMerge');
+        const mergeHeadPath = pathNode.posix.join(this.dir, '.git', 'MERGE_HEAD');
+        if (!this.fs.existsSync(mergeHeadPath)) {
+            throw new Error('fatal: There is no merge to abort (MERGE_HEAD missing).');
+        }
+        try {
+            // HEAD did not move on conflict, so a forced checkout to HEAD
+            // restores workdir+index from the pre-merge snapshot.
+            await git.checkout({ fs: this.fs, dir: this.dir, ref: 'HEAD', force: true });
+            this._clearMergeStateFiles();
+            this._dirtyFiles.clear();
+            this._logOperation('abortMerge', {}, { success: true });
+        } catch (error) {
+            this._logOperation('abortMerge', {}, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Returns a mergeDriver that resolves every conflict by taking either
+     * our side (contents[1]) or their side (contents[2]) wholesale — the
+     * isomorphic-git equivalent of `git merge --strategy-option=ours|theirs`.
+     */
+    private _strategyMergeDriver(strategy: 'ours' | 'theirs'): (args: { contents: string[] }) => { cleanMerge: true; mergedText: string } {
+        const pick = strategy === 'ours' ? 1 : 2;
+        return ({ contents }) => ({ cleanMerge: true, mergedText: contents[pick] });
+    }
+
+    private _writeGitStateFile(name: string, content: string): void {
+        const fullPath = pathNode.posix.join(this.dir, '.git', name);
+        this.fs.writeFileSync(fullPath, content);
+    }
+
+    private _clearMergeStateFiles(): void {
+        for (const name of ['MERGE_HEAD', 'MERGE_MSG', 'MERGE_MODE']) {
+            const p = pathNode.posix.join(this.dir, '.git', name);
+            if (this.fs.existsSync(p)) this.fs.unlinkSync(p);
         }
     }
 
@@ -1652,30 +1775,45 @@ export class MemoryGit {
         try {
             let changes: DiffEntry[];
 
-            if (options.fromRef) {
+            // `git diff HEAD` (single ref, no toRef) is workdir-vs-HEAD in the
+            // CLI — route through the matrix path, not the tree-walk path,
+            // which would compare HEAD to HEAD and always be empty.
+            const isWorkdirVsHead = options.fromRef === 'HEAD' && !options.toRef;
+
+            if (options.fromRef && !isWorkdirVsHead) {
                 const toRef = options.toRef ?? 'HEAD';
                 const changed = await this.getChangedFiles(options.fromRef, toRef);
                 changes = changed.map(c => ({ filepath: c.filepath, status: c.status }));
             } else {
                 const matrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
+                // statusMatrix uses an mtime-second + size shortcut that can
+                // miss same-size edits in fast in-memory flows. Re-hash any
+                // file we know was touched via memory-git's writeFile/delete
+                // path so workdir status is authoritative.
+                const verifyMap = options.cached
+                    ? new Map<string, number>()
+                    : await this._verifyDirtyWorkdir();
                 changes = [];
                 for (const [filepath, head, workdir, stage] of matrix) {
                     const h = head as number;
-                    const w = workdir as number;
+                    let w = workdir as number;
                     const s = stage as number;
+                    const fp = filepath as string;
+                    const overridden = verifyMap.get(fp);
+                    if (overridden !== undefined) w = overridden;
 
                     if (options.cached) {
                         // Only differences between HEAD and index
                         if (h !== s) {
                             changes.push({
-                                filepath: filepath as string,
+                                filepath: fp,
                                 status: this._getStatusText(h, w, s)
                             });
                         }
                     } else {
                         if (h !== w || h !== s) {
                             changes.push({
-                                filepath: filepath as string,
+                                filepath: fp,
                                 status: this._getStatusText(h, w, s)
                             });
                         }
@@ -1688,12 +1826,26 @@ export class MemoryGit {
                 changes = changes.filter(c => set.has(c.filepath));
             }
 
+            if (options.filter && options.filter.length > 0) {
+                const set = new Set(options.filter.map(c => c.toUpperCase()));
+                changes = changes.filter(c => set.has(this._statusToFilterCode(c.status)));
+            }
+
             this._logOperation('diff', { options }, { success: true, changes: changes.length });
             return changes;
         } catch (error) {
             this._logOperation('diff', { options }, null, error as Error);
             throw error;
         }
+    }
+
+    /**
+     * True if `diff(options)` would return at least one entry — the boolean
+     * shape of `git diff --quiet` (exit 0 clean, exit 1 dirty).
+     */
+    async hasDiff(options: DiffOptions = {}): Promise<boolean> {
+        const entries = await this.diff(options);
+        return entries.length > 0;
     }
 
     /**

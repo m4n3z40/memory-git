@@ -186,6 +186,14 @@ export interface MergeOptions {
     fastForwardOnly?: boolean;
     /** Custom merge commit message */
     message?: string;
+    /**
+     * Conflict resolution preference (`--strategy-option=ours|theirs`).
+     * Auto-resolves every conflict by keeping our side or their side wholesale,
+     * with no conflict markers.
+     */
+    strategy?: 'ours' | 'theirs';
+    /** Allow merging two branches with no common ancestor (--allow-unrelated-histories) */
+    allowUnrelatedHistories?: boolean;
 }
 
 export interface CreateTagOptions {
@@ -269,6 +277,9 @@ export interface ResolveRefOptions {
     abbrevRef?: boolean;
 }
 
+/** Single-letter status codes accepted by `git diff --diff-filter` */
+export type DiffFilterCode = 'A' | 'C' | 'D' | 'M' | 'R' | 'T' | 'U' | 'X' | 'B';
+
 export interface DiffOptions {
     /** Compare staged changes against HEAD (git diff --cached) */
     cached?: boolean;
@@ -278,6 +289,8 @@ export interface DiffOptions {
     toRef?: string;
     /** Restrict diff to these paths */
     paths?: string[];
+    /** Keep only entries whose status matches one of these codes (--diff-filter=ACMR) */
+    filter?: DiffFilterCode[];
 }
 
 export interface ShowResult {

@@ -86,10 +86,10 @@ await mg.exec('git config user.name "Agent"');
 | `status` | (default human-readable), `--porcelain`, `-s/--short`, `-b/--branch` |
 | `log` | `-n <count>`, `--oneline`, `--author=<s>`, `--since=<iso>`, `--until=<iso>`, `<ref>` |
 | `show` | `<ref>` |
-| `diff` | `--cached/--staged`, `--name-only`, `--name-status`, `<from> <to>` |
-| `branch` | (list), `<name>` (create), `-d/-D <name>`, `-m <old> <new>` |
+| `diff` | `--cached/--staged`, `--name-only`, `--name-status`, `--diff-filter=ACMR`, `-q/--quiet`, `<ref>` (workdir vs ref), `<from> <to>` |
+| `branch` | (list), `<name>` (create), `-d/-D <name>`, `-m <old> <new>`, `--show-current` |
 | `checkout` | `<ref>`, `-b <new>`, `-f`, `-- <files...>` |
-| `merge` | `<branch>`, `--no-ff`, `--ff-only`, `-m <msg>` |
+| `merge` | `<branch>`, `--no-ff`, `--ff-only`, `-m <msg>`, `--abort`, `-X/--strategy-option=ours\|theirs`, `--allow-unrelated-histories`, `--no-edit` |
 | `tag` | `<name>`, `-a -m <msg>`, `-d <name>`, `-f`, `-l` |
 | `show-ref` | `--tags`, `-d/--dereference` |
 | `describe` | `--exact-match --tags <ref>` |
@@ -163,8 +163,9 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `commit(message, options?)` | Returns SHA. `{amend, allowEmpty, all, author, date}` |
 | `status()` | Returns `FileStatus[]` |
 | `statusText(options?)` | Porcelain/short/branch text format |
-| `diff(options?)` | `{cached, fromRef, toRef, paths}` |
+| `diff(options?)` | `{cached, fromRef, toRef, paths, filter}` — `filter` accepts `'A'\|'C'\|'D'\|'M'\|'R'\|'T'\|'U'\|'X'\|'B'` codes (`git diff --diff-filter`) |
 | `diffText(options?)` | `{nameOnly, nameStatus}` |
+| `hasDiff(options?)` | Boolean shape of `git diff --quiet` — `true` iff `diff(options)` would return any entries |
 
 ### History
 
@@ -192,7 +193,8 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `listBranches()` | Returns `BranchInfo[]` |
 | `branchText()` | `git branch` text format (current branch prefixed with `*`) |
 | `currentBranch()` | Returns current branch name |
-| `merge(branch, options?)` | `{noFastForward, fastForwardOnly, message}` |
+| `merge(branch, options?)` | `{noFastForward, fastForwardOnly, message, strategy, allowUnrelatedHistories}`. `strategy: 'ours'\|'theirs'` resolves every conflict by keeping that side wholesale (mirrors `git merge -X ours\|theirs`) |
+| `abortMerge()` | `git merge --abort`. Restores the working tree to its pre-merge state and clears `MERGE_HEAD`/`MERGE_MSG`/`MERGE_MODE`. Throws if no merge is in progress |
 
 ### Tags
 
@@ -482,11 +484,11 @@ Run `pnpm run benchmark` to reproduce.
 |---|---|---|---|
 | Process spawn overhead | ~12-13ms / call | none | — |
 | `exec()` parsing overhead (tokenize + flag-parse) | — | ~3-6µs / call | negligible |
-| 400 small commands (status / log / rev-parse / branch) | 5581ms | 43ms | **129× faster** |
-| 100 sequential commits | 3499ms | 176ms | **19.9× faster** |
-| 200 status / write / add / commit / log cycles | 15723ms | 1050ms | **15.0× faster** |
-| 50× repeated `git log` | 703ms | 37ms | **18.8× faster** |
-| Init + 50 files + commit + branch + merge | 958ms | 102ms | **9.4× faster** |
+| 500 small commands (status / log / rev-parse / branch --show-current / diff --quiet) | 6196ms | 68ms | **90× faster** |
+| 100 sequential commits | 3542ms | 181ms | **19.5× faster** |
+| 200 status / write / add / commit / log cycles | 15107ms | 1013ms | **14.9× faster** |
+| 50× repeated `git log` | 711ms | 39ms | **18.2× faster** |
+| Init + 50 files + commit + branch + merge | 965ms | 104ms | **9.2× faster** |
 
 Three takeaways:
 

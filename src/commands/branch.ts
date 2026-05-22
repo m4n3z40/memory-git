@@ -7,8 +7,11 @@ const branch: Command = {
         const a = mri(args, {
             alias: { d: 'delete', D: 'delete-force', m: 'move' },
             string: ['delete', 'delete-force'],
-            boolean: ['move'],
+            boolean: ['move', 'show-current'],
         });
+        if (a['show-current']) {
+            return (await mg.currentBranch()) ?? '';
+        }
         if (a.move) {
             const [oldN, newN] = a._.map(String);
             if (!oldN || !newN) throw new Error('branch -m requires <old> <new>');

@@ -710,13 +710,16 @@ async function benchmarkAgentWorkflow() {
     cliGit('git add .');
     cliGit('git commit -m "seed"');
 
-    // CLI: each call spawns a process
+    // CLI: each call spawns a process. Includes the kinds of probes a CI/
+    // version-manager script does between turns (--quiet diff check,
+    // --show-current branch lookup).
     const tCli = process.hrtime.bigint();
     for (let i = 0; i < iterations; i++) {
         cliGit('git status --porcelain');
         cliGit('git log --oneline -n 1');
         cliGit('git rev-parse --abbrev-ref HEAD');
-        cliGit('git branch');
+        cliGit('git branch --show-current');
+        try { cliGit('git diff --quiet HEAD'); } catch (_) { /* exit 1 = dirty, also fine */ }
     }
     const cliMs = Number(process.hrtime.bigint() - tCli) / 1_000_000;
 
@@ -729,12 +732,13 @@ async function benchmarkAgentWorkflow() {
         await mg.exec('git status --porcelain');
         await mg.exec('git log --oneline -n 1');
         await mg.exec('git rev-parse --abbrev-ref HEAD');
-        await mg.exec('git branch');
+        await mg.exec('git branch --show-current');
+        try { await mg.exec('git diff --quiet HEAD'); } catch (_) { /* exitCode=1 = dirty */ }
     }
     const execMs = Number(process.hrtime.bigint() - tExec) / 1_000_000;
 
-    const total = iterations * 4;
-    console.log(`\n📊 ${total} small git commands (status / log / rev-parse / branch):`);
+    const total = iterations * 5;
+    console.log(`\n📊 ${total} small git commands (status / log / rev-parse / branch --show-current / diff --quiet):`);
     console.log(`   Git CLI subprocess:   ${cliMs.toFixed(2)}ms (${(cliMs / total).toFixed(2)}ms/call)`);
     console.log(`   MemoryGit exec():     ${execMs.toFixed(2)}ms (${(execMs / total).toFixed(2)}ms/call)`);
     console.log(`   Speedup:              ${(cliMs / execMs).toFixed(1)}x faster`);
