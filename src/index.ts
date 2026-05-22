@@ -1151,7 +1151,10 @@ export class MemoryGit {
             const result = await git.merge({
                 fs: this.fs,
                 dir: this.dir,
-                theirs: theirBranch,
+                // Pass the resolved oid (not the original ref string) so
+                // isomorphic-git's internal resolveRef doesn't choke on refs
+                // it can't parse — most notably FETCH_HEAD's multi-line shape.
+                theirs: theirsOid,
                 author: this.author,
                 fastForward: options.noFastForward ? false : undefined,
                 fastForwardOnly: options.fastForwardOnly,
