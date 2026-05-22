@@ -342,18 +342,50 @@ export class MemoryGit {
         const { base, ops } = this._parseRevSuffix(ref);
         if (!base) throw new Error(`fatal: bad revision '${ref}'`);
         let oid: string;
-        try {
-            oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: base });
-        } catch (e) {
-            if (/^[0-9a-f]{4,40}$/i.test(base)) {
-                oid = await git.expandOid({ fs: this.fs, dir: this.dir, oid: base });
-            } else {
-                // Preserve the original git CLI error shape — callers (and tests)
-                // grep for "Could not find <ref>" / "bad revision <ref>".
-                throw e;
+        // `.git/FETCH_HEAD` uses git's multi-line `<oid>\t[not-for-merge]\t<desc>`
+        // format, which isomorphic-git's resolveRef doesn't parse (it trims and
+        // recurses). Read it directly when asked.
+        if (base === 'FETCH_HEAD') {
+            const fromFile = this._readFetchHeadOid();
+            if (!fromFile) throw new Error(`Could not find ${ref}.`);
+            oid = fromFile;
+        } else {
+            try {
+                oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: base });
+            } catch (e) {
+                if (/^[0-9a-f]{4,40}$/i.test(base)) {
+                    oid = await git.expandOid({ fs: this.fs, dir: this.dir, oid: base });
+                } else {
+                    // Preserve the original git CLI error shape — callers (and tests)
+                    // grep for "Could not find <ref>" / "bad revision <ref>".
+                    throw e;
+                }
             }
         }
         return ops.length > 0 ? this._walkRevSuffix(oid, ops, ref) : oid;
+    }
+
+    /**
+     * Reads `.git/FETCH_HEAD` and returns the oid of the merge candidate
+     * (the first line whose middle column is NOT "not-for-merge", falling
+     * back to the first line). Returns `null` if the file is missing.
+     * @private
+     */
+    private _readFetchHeadOid(): string | null {
+        const path = pathNode.posix.join(this.dir, '.git', 'FETCH_HEAD');
+        if (!this.fs.existsSync(path)) return null;
+        const content = (this.fs.readFileSync(path, 'utf8') as string).trim();
+        if (!content) return null;
+        const lines = content.split('\n');
+        // Format per `git help fetch`: `<oid>\t[not-for-merge]\t<desc>`
+        // Prefer the merge candidate (empty 2nd field); fall back to first line.
+        const merge = lines.find(l => {
+            const parts = l.split('\t');
+            return parts.length >= 2 && parts[1].trim() === '';
+        });
+        const chosen = merge ?? lines[0];
+        const oid = chosen.split('\t')[0].trim();
+        return /^[0-9a-f]{40}$/i.test(oid) ? oid : null;
     }
 
     /**
@@ -1190,6 +1222,21 @@ export class MemoryGit {
     private _writeGitStateFile(name: string, content: string): void {
         const fullPath = pathNode.posix.join(this.dir, '.git', name);
         this.fs.writeFileSync(fullPath, content);
+    }
+
+    /**
+     * Writes `.git/FETCH_HEAD` in real-git's format so the fetched ref is
+     * immediately reachable as `FETCH_HEAD` (for `merge FETCH_HEAD`,
+     * `diff HEAD FETCH_HEAD`, etc.). Line shape:
+     *   <oid>\t\t<description>\n
+     * (a tab after the oid marks "not-for-merge" or empty for the merged
+     * branch; we leave it empty to match `git fetch <url> <ref>`.)
+     * @private
+     */
+    private _writeFetchHead(oid: string | null | undefined, description: string | null | undefined): void {
+        if (!oid) return;
+        const desc = description ?? '';
+        this._writeGitStateFile('FETCH_HEAD', `${oid}\t\t${desc}\n`);
     }
 
     private _clearMergeStateFiles(): void {
@@ -2144,7 +2191,7 @@ export class MemoryGit {
             if (options.url) {
                 await this._ensureDefaultFetchRefspec(remoteName);
             }
-            await this._withSignal(git.fetch({
+            const result = await this._withSignal(git.fetch({
                 fs: this.fs,
                 http,
                 dir: this.dir,
@@ -2155,6 +2202,10 @@ export class MemoryGit {
                 singleBranch: options.singleBranch,
                 ref: options.ref
             }), options.signal);
+            // isomorphic-git doesn't write FETCH_HEAD, but real git does on
+            // every fetch — and downstream flows rely on `merge FETCH_HEAD`
+            // / `diff HEAD FETCH_HEAD` working immediately after.
+            this._writeFetchHead(result.fetchHead, result.fetchHeadDescription);
             this._logOperation('fetch', { ...useUrl, options }, { success: true });
             return true;
         } catch (error) {
