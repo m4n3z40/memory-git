@@ -66,6 +66,18 @@ export async function realPathExists(filepath: string): Promise<boolean> {
 }
 
 /**
+ * True iff a node fs error is ENOENT — file/dir vanished. We use this in the
+ * incremental disk→memory walk to tolerate a concurrent mutator (native git
+ * gc/repack/prune deleting object dirs, branch updates rotating refs) without
+ * tearing down the whole walk. The alternative — propagating ENOENT — left
+ * memfs and the disk-snapshot half-updated, which produced the pack/idx
+ * mtime divergence corruption observed in prod.
+ */
+function isENOENT(err: unknown): boolean {
+    return (err as NodeJS.ErrnoException)?.code === 'ENOENT';
+}
+
+/**
  * Walk the source tree and collect every .gitignore's patterns, translated to
  * root-relative form. Nested files get a path prefix; leading `!` (negation)
  * and `/` (anchored) are preserved.
@@ -228,7 +240,18 @@ export async function copyDiskToMemoryIncremental(
     snapshot: Map<string, FileFingerprint>,
     seen: Set<string>,
 ): Promise<{ read: number; skipped: number }> {
-    const entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
+    let entries: Dirent[];
+    try {
+        entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
+    } catch (err) {
+        // Subtree vanished between the parent's readdir and ours — a concurrent
+        // git gc / repack / branch update can remove .git/objects/XX/ while we
+        // walk. Treat as empty; the caller diffs `seen` against `snapshot` to
+        // reconcile the deletion, and a follow-up loadFromDisk picks up the
+        // post-mutation state.
+        if (isENOENT(err)) return { read: 0, skipped: 0 };
+        throw err;
+    }
 
     const results = await Promise.all(entries.map(async (entry) => {
         const entryRel = relPath ? pathNode.posix.join(relPath, entry.name) : entry.name;
@@ -242,32 +265,45 @@ export async function copyDiskToMemoryIncremental(
         const realEntryPath = pathNode.join(realPath, entry.name);
         const memoryEntryPath = pathNode.posix.join(memoryPath, entry.name);
 
-        if (entry.isDirectory()) {
-            fs.mkdirSync(memoryEntryPath, { recursive: true });
-            return await copyDiskToMemoryIncremental(
-                fs, realEntryPath, memoryEntryPath, matcher, entryRel, snapshot, seen,
-            );
-        }
-
-        if (entry.isFile()) {
-            seen.add(entryRel);
-            const stat = await fsRealAsync.stat(realEntryPath);
-            const prior = snapshot.get(entryRel);
-            // Fast pre-filter: same size + same mtime ⇒ disk hasn't changed.
-            if (prior && prior.size === stat.size && prior.mtimeMs === stat.mtimeMs) {
-                return { read: 0, skipped: 1 };
+        try {
+            if (entry.isDirectory()) {
+                fs.mkdirSync(memoryEntryPath, { recursive: true });
+                return await copyDiskToMemoryIncremental(
+                    fs, realEntryPath, memoryEntryPath, matcher, entryRel, snapshot, seen,
+                );
             }
-            const content = await fsRealAsync.readFile(realEntryPath);
-            fs.writeFileSync(memoryEntryPath, content);
-            snapshot.set(entryRel, {
-                size: stat.size,
-                mtimeMs: stat.mtimeMs,
-                hash: hashBuffer(content),
-            });
-            return { read: 1, skipped: 0 };
-        }
 
-        return { read: 0, skipped: 0 };
+            if (entry.isFile()) {
+                // stat first, then mark `seen` only on success. A file that
+                // ENOENTs here was deleted by an external mutator between our
+                // readdir and our stat; leaving it OUT of `seen` lets the
+                // caller's deletion sweep drop the stale snapshot+memfs entry.
+                const stat = await fsRealAsync.stat(realEntryPath);
+                const prior = snapshot.get(entryRel);
+                // Fast pre-filter: same size + same mtime ⇒ disk hasn't changed.
+                if (prior && prior.size === stat.size && prior.mtimeMs === stat.mtimeMs) {
+                    seen.add(entryRel);
+                    return { read: 0, skipped: 1 };
+                }
+                const content = await fsRealAsync.readFile(realEntryPath);
+                fs.writeFileSync(memoryEntryPath, content);
+                snapshot.set(entryRel, {
+                    size: stat.size,
+                    mtimeMs: stat.mtimeMs,
+                    hash: hashBuffer(content),
+                });
+                seen.add(entryRel);
+                return { read: 1, skipped: 0 };
+            }
+
+            return { read: 0, skipped: 0 };
+        } catch (err) {
+            // Same rationale as the top-level readdir guard: a file/dir that
+            // vanished mid-walk is not an error — it's a deletion the caller
+            // will reconcile via the `seen` diff.
+            if (isENOENT(err)) return { read: 0, skipped: 0 };
+            throw err;
+        }
     }));
 
     let read = 0;
@@ -327,8 +363,32 @@ export async function copyMemoryToDiskIncremental(
         // touching the snapshot so the skip holds even if the snapshot lacks
         // this path or is stale (e.g. memfs got a re-compressed copy from a
         // subsequent git.add()).
-        if (isImmutableObjectPath(entryRel) && await realPathExists(realEntryPath)) {
-            return { written: 0, skipped: 1 };
+        if (isImmutableObjectPath(entryRel)) {
+            if (await realPathExists(realEntryPath)) {
+                return { written: 0, skipped: 1 };
+            }
+            // Disk says the immutable object is gone. If we've previously
+            // observed it on disk (snapshot.has → true), the file was removed
+            // by an external mutator (git gc / repack / prune) and our memfs
+            // copy is now a stale ghost. Writing it back resurrects orphaned
+            // pack files whose .idx and .pack mtimes drift across flushes —
+            // the exact corruption signature observed in prod (memory-git@3.6.1,
+            // pods-manager 2026-05-22: unknown object type 0 in pack reads).
+            // Drop from memfs+snapshot instead so the next loadFromDisk
+            // reconciles against the post-mutation disk state.
+            //
+            // If the path is NOT in the snapshot, this is a fresh immutable
+            // object created in memfs (e.g. isomorphic-git committed and
+            // produced a new loose object). Fall through to the write path.
+            if (snapshot.has(entryRel)) {
+                try {
+                    fs.unlinkSync(memoryEntryPath);
+                } catch {
+                    // Already gone from memfs; snapshot delete below restores consistency.
+                }
+                snapshot.delete(entryRel);
+                return { written: 0, skipped: 1 };
+            }
         }
 
         const content = fs.readFileSync(memoryEntryPath) as Buffer;
