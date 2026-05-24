@@ -117,6 +117,23 @@ export interface MemoryGitOptions {
      * and `force` still apply when this is true.
      */
     tracksDiskSnapshot?: boolean;
+    /**
+     * Defer reading file contents until first access (default: false). When
+     * true, `loadFromDisk` only walks the source tree to learn what exists
+     * (stat + readdir) and records each path in a lazy index. Files are
+     * materialized into the in-memory volume the first time anything reads
+     * them — through any of the fs APIs isomorphic-git or this library
+     * touches. Untouched files never load.
+     *
+     * Trade-offs: random-access reads (`show HEAD:path`, `cat-file`, ref
+     * lookups) get the full saving. Operations that iterate the workdir
+     * (`add('.')`, `status`) still materialize everything they walk. Pack
+     * files have no internal seek — once any object inside is read, the
+     * whole pack loads. Materialized files participate in the disk snapshot
+     * normally; `flush()` only writes files that were actually changed in
+     * memory.
+     */
+    lazy?: boolean;
 }
 
 export interface CloneOptions {

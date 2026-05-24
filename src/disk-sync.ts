@@ -424,6 +424,53 @@ export async function copyMemoryToDiskIncremental(
 }
 
 /**
+ * Lazy disk walk. Builds the in-memory directory skeleton via mkdirSync and
+ * records every file path it would have read into `addFile`, without ever
+ * opening file contents. The reader function lives in `lazy-fs.ts` and is
+ * passed in as a callback so disk-sync stays free of the lazy-state type.
+ *
+ * Mirrors the ignore semantics of `copyDiskToMemory`: the matcher applies
+ * everywhere except inside the repo's own `.git/`, which is always indexed.
+ */
+export async function indexDiskLazy(
+    fs: MemFs,
+    realPath: string,
+    memoryPath: string,
+    matcher: Matcher,
+    relPath: string,
+    addFile: (memPath: string, realPath: string, size: number, mtimeMs: number) => void,
+): Promise<number> {
+    const entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
+
+    const promises = entries.map(async (entry) => {
+        const entryRel = relPath ? pathNode.posix.join(relPath, entry.name) : entry.name;
+
+        const insideGit = entryRel === '.git' || entryRel.startsWith('.git/');
+        if (!insideGit) {
+            const probe = entry.isDirectory() ? `${entryRel}/` : entryRel;
+            if (matcher.ignores(probe)) return 0;
+        }
+
+        const realEntryPath = pathNode.join(realPath, entry.name);
+        const memoryEntryPath = pathNode.posix.join(memoryPath, entry.name);
+
+        if (entry.isDirectory()) {
+            fs.mkdirSync(memoryEntryPath, { recursive: true });
+            return await indexDiskLazy(fs, realEntryPath, memoryEntryPath, matcher, entryRel, addFile);
+        }
+        if (entry.isFile()) {
+            const stat = await fsRealAsync.stat(realEntryPath);
+            addFile(memoryEntryPath, realEntryPath, stat.size, stat.mtimeMs);
+            return 1;
+        }
+        return 0;
+    });
+
+    const results = await Promise.all(promises);
+    return results.reduce((acc, val) => acc + val, 0);
+}
+
+/**
  * Recursively list files under an in-memory directory. By default skips
  * `.git/` so callers don't have to filter; pass `includeGit: true` for the
  * full set.

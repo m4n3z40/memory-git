@@ -135,7 +135,7 @@ The class-based API is fully typed and remains the preferred entry point when yo
 
 | Method | Description |
 |--------|-------------|
-| `new MemoryGit(name?)` | Creates instance with isolated volume |
+| `new MemoryGit(name?, options?)` | Creates instance with isolated volume. `{tracksDiskSnapshot, lazy}` — `lazy:true` defers reading file contents until first access (see [Lazy mode](#lazy-mode)) |
 | `setAuthor(name, email)` | Sets commit author |
 | `config(key, value?)` | Get/set git config (special-cases `user.name`/`user.email` to sync with author) |
 | `init(options?)` | Initializes empty repo. `{defaultBranch, bare}` |
@@ -410,6 +410,31 @@ await mg.flush();                       // back to original path
 await mg.flush('./output-dir');         // or somewhere else
 ```
 
+### Lazy mode
+
+Default `loadFromDisk` reads every working-tree file and the entire `.git/` into memory up front. For repos where you only need a tiny slice — an agent that reads HEAD plus one or two paths, a CI probe that runs `git log` once and exits — that's a lot of pointless I/O.
+
+Pass `{ lazy: true }` to the constructor and `loadFromDisk` only walks the tree to learn what exists (one `stat` per file, no `read`). File bytes are pulled in the first time anything reads them through the wrapped fs — `readFile`, `git.log`, `git.checkout`, etc. Anything you never touch stays on disk.
+
+```typescript
+const mg = new MemoryGit('agent', { lazy: true });
+await mg.loadFromDisk('./big-repo');   // stat-only walk, near-zero bytes in RAM
+await mg.log({ depth: 1 });            // faults in only the refs + packs it needs
+await mg.readFile('src/util.ts');      // faults this one file
+await mg.flush();                       // writes only what changed in memory
+```
+
+Materialized files participate in the normal disk snapshot, so `flush()` stays incremental — untouched lazy files are never re-written. Deleting a still-lazy file in memory (`mg.deleteFile('x')`) produces a tombstone that `flush()` propagates as a disk-side delete.
+
+**Trade-offs, explicitly:**
+
+- **Pack files are all-or-nothing.** A `pack-*.pack` is loaded whole the first time any object inside is read — there's no seek inside memfs. You save on packs you never touch; you don't save *within* a pack.
+- **Operations that iterate the working tree force-materialize everything they visit.** `add('.')`, `status`, `statusMatrix` walk every tracked file. If your workflow ends with one of those, lazy doesn't help you. Lazy shines on random-access reads.
+- **`flush({ force: true })` does not refault.** A force-flush rewrites only what's currently in memory — lazy files stay where they are on disk. If you need a true bit-for-bit rewrite of the destination, don't use lazy mode.
+- **External mutation between load and read.** Lazy holds onto the `realPath` it captured at load time. If something else deletes or replaces that file on disk before you fault it in, the read surfaces `ENOENT`. Call `loadFromDisk()` again to reconcile.
+
+Lazy and `tracksDiskSnapshot` compose: the wrapper feeds the snapshot a fingerprint for each file as it materializes, so the next `flush({ clean: true })` only writes what actually changed.
+
 ### Incremental sync
 
 **Since 3.4, incremental sync is the default.** `loadFromDisk` builds a per-file fingerprint (size + mtime + sha1) during the load, and `flush` uses it to write only files whose content actually changed.
@@ -527,12 +552,14 @@ Run `pnpm run benchmark` to reproduce.
 | 50× repeated `git log` | 711ms | 39ms | **18.2× faster** |
 | Init + 50 files + commit + branch + merge | 965ms | 104ms | **9.2× faster** |
 | End-to-end `gc` on 500-commit repo (1500 loose objects): native `git gc` in place vs `loadFromDisk + mg.gc() + flush({clean:true})` | 393ms | 1159ms (116 load + 793 gc + 250 flush) | Native wins ~3× on local SSD. Ratio inverts on EFS/NFS — see below |
+| `loadFromDisk` on 500-file repo (~1MB workdir + `.git/`) | eager: 45.5ms / ~1.77 MB in RAM | lazy: 11.0ms / near-zero in RAM (dir skeleton only) | **~4× faster load** + memory scales with what you actually read, not repo size. First read of any path pays its disk cost — see [Lazy mode](#lazy-mode) |
 
-Three takeaways:
+Four takeaways:
 
 1. **`exec()` parsing is free.** It adds 3-6µs to a call that previously cost ~12ms via subprocess. The string-API ergonomics carry no real cost.
 2. **The agent-loop pattern is the killer use case.** Many small read-style calls amortize JS-level overhead and skip the per-call spawn tax — **>100× faster end-to-end**.
 3. **Multi-file commits are also faster.** A dirty-set tracker (writeFile marks files as needing re-stage; `add('.')` only touches those) means write-heavy workloads beat the C binary on local SSD too.
+4. **Lazy mode decouples startup cost from repo size.** When you only need a slice of the repo (HEAD + one path, one `git log`), `{ lazy: true }` skips the full-tree read and faults files in on first access.
 
 **The gap widens dramatically on slow filesystems.** Git's `.git/objects/` is small-file-heavy by design (one file per blob, tree, and commit), which is the worst-case access pattern for EFS, NFS, and overlay/networked dev-container volumes. A `git log` over a large history that runs in 50ms on local SSD can take tens of seconds on EFS — every object is a round-trip. MemoryGit keeps all that in RAM and only flushes the actual working-tree files back when you ask it to.
 

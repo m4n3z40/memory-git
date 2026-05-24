@@ -855,6 +855,92 @@ async function benchmarkAgentWorkflow() {
 }
 
 /**
+ * Lazy mode: only the file bytes you touch are read from disk. The big win
+ * is on repos where you load once but only need a tiny slice — e.g. an agent
+ * that reads HEAD + one path. Eager always loads every working-tree byte
+ * plus every byte of `.git/`.
+ */
+async function benchmarkLazyVsEager() {
+    console.log('\n' + '='.repeat(70));
+    console.log('BENCHMARK: Lazy vs Eager loadFromDisk');
+    console.log('='.repeat(70));
+
+    const repoPath = '/tmp/benchmark-lazy';
+    await fs.rm(repoPath, { recursive: true, force: true }).catch(() => {});
+    await fs.mkdir(repoPath, { recursive: true });
+    const gitCmd = (cmd) => execSync(cmd, { cwd: repoPath, stdio: 'pipe' });
+    gitCmd('git init -q -b main');
+    gitCmd('git config user.email "b@b.com"');
+    gitCmd('git config user.name "B"');
+    gitCmd('git config gc.auto 0');
+
+    // Build a repo that's heavy on working-tree bytes: 500 files * 2KB.
+    // Lazy mode should never have to read most of them.
+    const fileCount = 500;
+    const fileSize = 2048;
+    for (let i = 0; i < fileCount; i++) {
+        const dir = path.join(repoPath, `pkg${Math.floor(i / 20)}`);
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(path.join(dir, `file${i}.txt`), generateContent(fileSize));
+    }
+    gitCmd('git add -A');
+    gitCmd('git commit -q -m initial');
+
+    const time = async (fn) => {
+        const start = process.hrtime.bigint();
+        const result = await fn();
+        return { ms: Number(process.hrtime.bigint() - start) / 1_000_000, result };
+    };
+
+    // --- Eager (default) ---
+    const eager = new MemoryGit('eager');
+    const eagerLoad = await time(() => eager.loadFromDisk(repoPath));
+    const eagerMem = eager.getMemoryUsage();
+    const eagerLog = await time(() => eager.log({ depth: 1 }));
+    const eagerRead = await time(() => eager.readFile('pkg0/file0.txt'));
+    const eagerMemAfter = eager.getMemoryUsage();
+
+    // --- Lazy ---
+    const lazy = new MemoryGit('lazy', { lazy: true });
+    const lazyLoad = await time(() => lazy.loadFromDisk(repoPath));
+    const lazyMem = lazy.getMemoryUsage();
+    const lazyLog = await time(() => lazy.log({ depth: 1 }));
+    const lazyRead = await time(() => lazy.readFile('pkg0/file0.txt'));
+    const lazyMemAfterRead = lazy.getMemoryUsage();
+
+    const fmtMB = (b) => (b / 1024 / 1024).toFixed(2) + ' MB';
+    console.log(`\n📦 Source repo: ${fileCount} files × ${fileSize}B + .git/`);
+    console.log(`\n📂 Load:`);
+    console.log(`   Eager:  ${eagerLoad.ms.toFixed(2)}ms   files-in-memory=${eagerMem.files}   approx=${fmtMB(eagerMem.estimatedSizeBytes)}`);
+    console.log(`   Lazy:   ${lazyLoad.ms.toFixed(2)}ms   files-in-memory=${lazyMem.files}   approx=${fmtMB(lazyMem.estimatedSizeBytes)}`);
+    console.log(`           ← lazy load is ${(eagerLoad.ms / Math.max(lazyLog.ms, 0.01)).toFixed(1)}× faster and starts at ~${Math.round(100 * (1 - lazyMem.estimatedSizeBytes / Math.max(eagerMem.estimatedSizeBytes, 1)))}% less memory`);
+
+    console.log(`\n🔎 git log -n 1 (after load):`);
+    console.log(`   Eager:  ${eagerLog.ms.toFixed(2)}ms`);
+    console.log(`   Lazy:   ${lazyLog.ms.toFixed(2)}ms   (faults in only the refs + packs it needs)`);
+
+    console.log(`\n📄 readFile of one workdir path (after load):`);
+    console.log(`   Eager:  ${eagerRead.ms.toFixed(2)}ms   (already in memory)`);
+    console.log(`   Lazy:   ${lazyRead.ms.toFixed(2)}ms   files-in-memory=${lazyMemAfterRead.files}   approx=${fmtMB(lazyMemAfterRead.estimatedSizeBytes)}`);
+    console.log(`           ← lazy memory grew only by the bytes of that one file + whatever git read`);
+
+    // Flush after no edits: lazy should write zero bytes; eager same (snapshot says nothing changed).
+    const dstEager = '/tmp/benchmark-lazy-dst-eager';
+    const dstLazy  = '/tmp/benchmark-lazy-dst-lazy';
+    await fs.rm(dstEager, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(dstLazy,  { recursive: true, force: true }).catch(() => {});
+    const eagerFlush = await time(() => eager.flush(dstEager));
+    const lazyFlush  = await time(() => lazy.flush(dstLazy));
+    console.log(`\n💾 flush to a fresh destination (cold snapshot for that path):`);
+    console.log(`   Eager:  ${eagerFlush.ms.toFixed(2)}ms   wrote=${eagerFlush.result} files`);
+    console.log(`   Lazy:   ${lazyFlush.ms.toFixed(2)}ms   wrote=${lazyFlush.result} files   (untouched files stay only on the source disk)`);
+
+    await fs.rm(repoPath, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(dstEager, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(dstLazy,  { recursive: true, force: true }).catch(() => {});
+}
+
+/**
  * Process spawn overhead benchmark vs in-memory operations
  */
 async function benchmarkProcessOverhead() {
@@ -944,6 +1030,9 @@ async function main() {
 
     // In-memory gc (pack + prune)
     await benchmarkGc();
+
+    // Lazy mode vs eager
+    await benchmarkLazyVsEager();
     
     console.log('\n' + '='.repeat(70));
     console.log('CONCLUSION');

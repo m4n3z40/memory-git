@@ -14,9 +14,11 @@ import {
     copyDiskToMemoryIncremental,
     copyMemoryToDisk,
     copyMemoryToDiskIncremental,
+    indexDiskLazy,
     listFilesRecursive,
     type FileFingerprint,
 } from './disk-sync.js';
+import { LazyState, wrapLazyFs } from './lazy-fs.js';
 import { getCommand, type Command } from './commands/index.js';
 
 type MemFs = ReturnType<typeof createFsFromVolume>;
@@ -184,16 +186,51 @@ export class MemoryGit {
     private _readOnly: boolean = false;
 
     /**
+     * Lazy mode flag. Set via constructor `{lazy:true}`. When true,
+     * `loadFromDisk` indexes paths without reading their bytes, and `this.fs`
+     * is wrapped to fault them in on first access. See `lazy-fs.ts`.
+     */
+    private _lazy: boolean = false;
+    /**
+     * Lazy index. Non-empty only when `_lazy` is true and a `loadFromDisk`
+     * has populated it. Updated through the wrapped `this.fs` as files
+     * are read/written/deleted.
+     */
+    private _lazyState: LazyState = new LazyState();
+    /**
+     * Direct (unwrapped) memfs view used by flush walks. In non-lazy mode
+     * it's the same object as `this.fs`. In lazy mode it bypasses the
+     * lazy wrapper so memory→disk sync only sees files actually in memory
+     * — untouched lazy files stay on disk untouched.
+     */
+    private _rawFs: MemFs;
+
+    /**
      * Creates a new MemoryGit instance.
      * @param name - Unique name to identify the instance
-     * @param options - Instance options (e.g. `{tracksDiskSnapshot:false}` to disable incremental sync entirely)
+     * @param options - Instance options (e.g. `{tracksDiskSnapshot:false}` to disable incremental sync entirely, `{lazy:true}` to defer disk reads until first access)
      */
     constructor(name: string = 'memory-git', options: MemoryGitOptions = {}) {
         this.name = name;
         this.vol = new Volume();
-        this.fs = createFsFromVolume(this.vol);
+        const rawFs = createFsFromVolume(this.vol);
+        this._rawFs = rawFs;
         if (options.tracksDiskSnapshot === false) {
             this._tracksDiskSnapshot = false;
+        }
+        if (options.lazy === true) {
+            this._lazy = true;
+            this.fs = wrapLazyFs(rawFs, this._lazyState, (memPath, size, mtimeMs, hash) => {
+                // Translate the in-memory path back to the snapshot key
+                // (repo-relative). The snapshot is keyed off `this.dir`,
+                // not the wrapper's view of it, so we strip the prefix.
+                const rel = memPath.startsWith(this.dir + '/')
+                    ? memPath.slice(this.dir.length + 1)
+                    : memPath;
+                this._diskSnapshot.set(rel, { size, mtimeMs, hash });
+            });
+        } else {
+            this.fs = rawFs;
         }
     }
 
@@ -540,10 +577,37 @@ export class MemoryGit {
                 this._diskSnapshot.clear();
                 this._snapshotPath = null;
             }
+            // Likewise the lazy index — paths in it point at the old source.
+            if (this._lazy) this._lazyState.reset();
             this.realDir = resolvedSource;
 
             let fileCount: number;
-            if (buildSnapshot) {
+            if (this._lazy) {
+                // Lazy load: walk the tree, index file paths + sizes + mtimes
+                // into the lazy state, but read no bytes. Materialization
+                // happens through the wrapped fs the first time anything
+                // touches a path; the wrapper's onMaterialize callback
+                // populates _diskSnapshot. Setting _snapshotPath here lets
+                // those incremental snapshot updates land in the right
+                // baseline so a subsequent flush is incremental.
+                this._snapshotPath = resolvedSource;
+                this._snapshotSkippedAtLoad = false;
+                let indexed = 0;
+                indexed = await indexDiskLazy(
+                    this.fs, this.realDir, this.dir, matcher, '',
+                    (memPath, realFilePath, size, mtimeMs) => {
+                        this._lazyState.addFile(memPath, { realPath: realFilePath, size, mtimeMs });
+                    },
+                );
+                fileCount = indexed;
+                this._logOperation('loadFromDisk', {
+                    sourcePath: this.realDir,
+                    respectGitignore,
+                    nestedGitignore,
+                    explicitIgnore,
+                    lazy: true,
+                }, { success: true, filesLoaded: fileCount, indexed, lazy: true });
+            } else if (buildSnapshot) {
                 this._snapshotPath = resolvedSource;
                 this._snapshotSkippedAtLoad = false;
                 const seen = new Set<string>();
@@ -1811,7 +1875,12 @@ export class MemoryGit {
             }
 
             if (forceFull || fallbackToFull) {
-                const fileCount = await copyMemoryToDisk(this.fs, this.dir, destination);
+                // Lazy mode: walking through `this.fs` would fault every
+                // indexed file into memfs just to write it back to disk —
+                // pointless work. Use the unwrapped view so the rewrite
+                // covers only files the user actually touched in memory.
+                const flushFs = this._lazy ? this._rawFs : this.fs;
+                const fileCount = await copyMemoryToDisk(flushFs, this.dir, destination);
                 // A full flush bypasses the snapshot; subsequent incremental flushes
                 // would have a stale baseline, so invalidate it.
                 this._diskSnapshot.clear();
@@ -1834,8 +1903,11 @@ export class MemoryGit {
             }
 
             const seen = new Set<string>();
+            // Same as the forceFull branch: in lazy mode, the memfs walk
+            // should only cover materialized files, not the lazy index.
+            const flushFs = this._lazy ? this._rawFs : this.fs;
             const { written, skipped } = await copyMemoryToDiskIncremental(
-                this.fs, this.dir, destination, '', this._diskSnapshot, seen,
+                flushFs, this.dir, destination, '', this._diskSnapshot, seen,
             );
 
             let removed = 0;
@@ -1850,6 +1922,29 @@ export class MemoryGit {
                         // Not on disk or unreadable; either way, drop from snapshot.
                     }
                     this._diskSnapshot.delete(path);
+                }
+            }
+
+            // Lazy-mode tombstones: files the user deleted while they were
+            // still unmaterialized never entered memfs, so the snapshot+seen
+            // diff above can't catch them. Propagate them to disk now and
+            // clear the tombstone set. This fires regardless of `clean` —
+            // a tombstone is an explicit user delete, not "noticed missing".
+            if (this._lazy && this._lazyState.tombstones.size > 0 && this._snapshotPath === destination) {
+                for (const memPath of [...this._lazyState.tombstones]) {
+                    const rel = memPath.startsWith(this.dir + '/')
+                        ? memPath.slice(this.dir.length + 1)
+                        : memPath;
+                    const fullPath = pathNode.join(destination, rel);
+                    try {
+                        await fsRealAsync.unlink(fullPath);
+                        removed += 1;
+                    } catch {
+                        // Already gone on disk — that's fine, the user's
+                        // intent (file should not exist) is satisfied.
+                    }
+                    this._diskSnapshot.delete(rel);
+                    this._lazyState.tombstones.delete(memPath);
                 }
             }
 
