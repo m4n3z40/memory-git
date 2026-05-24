@@ -104,8 +104,9 @@ await mg.exec('git config user.name "Agent"');
 | `rev-parse` | `<ref>`, `--short`, `--abbrev-ref` |
 | `rev-list` | `<ref>`, `--all`, `--reverse`, `-n/--max-count <n>` |
 | `ls-files` | — |
+| `gc` | `--quiet`, `--aggressive` (no-op), `--prune=<date>` (always behaves as `--prune=now`) |
 
-Unsupported subcommands (`rebase`, `cherry-pick`, `bisect`, `reflog`, `submodule`, `worktree`, `blame`, `gc`) throw a clear error rather than silently misbehaving.
+Unsupported subcommands (`rebase`, `cherry-pick`, `bisect`, `reflog`, `submodule`, `worktree`, `blame`) throw a clear error rather than silently misbehaving.
 
 ### Output format
 
@@ -224,6 +225,12 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `stash()` | Saves workdir changes, restores to HEAD |
 | `stashPop()` | Restores most recent stash |
 | `stashList()` | Stash count |
+
+### Maintenance
+
+| Method | Description |
+|--------|-------------|
+| `gc(options?)` | In-memory `git gc`: repacks every reachable object into a single new pack and prunes loose copies. `{consolidatePacks, includeRemoteRefs, includeTags}` — `consolidatePacks` (default `true`) rolls existing packs into the new one too. Returns `GcResult` with reachable/loose/pack counts. Run before `flush({clean: true})` to propagate the cleanup to disk. See [Garbage collection](#garbage-collection) for the workflow and limitations |
 
 ### Observability — the audit trail
 
@@ -445,6 +452,36 @@ If `loadFromDisk` runs with `skipSnapshot:true` and `flush` is then called witho
 
 The legacy `{incremental: true}` flag on both methods is accepted as a no-op alias of the new default so existing callers keep working.
 
+## Garbage collection
+
+Agent sessions that churn through speculative commits, branches, and resets pile up loose objects in `.git/objects/`. `mg.gc()` repacks every reachable object into a single packfile *in memory* and deletes the loose copies; `flush({clean: true})` propagates the cleanup to disk.
+
+**The reason this exists is slow filesystems.** Native `git gc` does thousands of metadata ops in place against `.git/objects/` — fast on local SSD, brutal on EFS/NFS/networked dev-container volumes where every loose-object unlink is a round-trip. The MemoryGit pipeline (`loadFromDisk → gc → flush({clean:true})`) collapses that into one bulk read of small files, an in-RAM repack, and one batched write of the new pack plus a delete sweep. On local SSD native `git gc` is faster end-to-end (~3×); on EFS/NFS the equation inverts.
+
+```typescript
+const mg = new MemoryGit();
+await mg.loadFromDisk('./repo');
+
+// ... agent does work, accumulates loose objects ...
+
+const result = await mg.gc();
+// { reachableObjects: 1500, looseDeleted: 1500, packsRemoved: 0,
+//   packFilename: 'pack-<sha>.pack', packSizeBytes: 3091382 }
+
+await mg.flush(null, { clean: true });
+// The `clean: true` is required: gc is a deletion event, and incremental
+// flush only writes — it doesn't remove disk files unless asked to.
+```
+
+Reachability is computed from local branches, remote-tracking branches, tags, and HEAD. Unreachable objects (e.g. commits orphaned by `reset --hard`) are dropped — there is no reflog grace period, so the effective behavior is `git gc --prune=now`.
+
+`{consolidatePacks: true}` (the default) rolls existing packs into the new one and deletes the old `.pack`/`.idx`/`.rev`/`.mtimes`/`.bitmap` files. The new pack remains content-addressed, so re-flushing it over an already-packed disk repo is a no-op for any pack that hasn't changed.
+
+**Limitations:**
+- `packObjects` buffers the entire new pack in memory before writing. Peak RAM during `gc()` is roughly the packed size of the repo.
+- No custom delta compression — the resulting pack may be larger than what `git gc` produces natively. Re-running `git gc` on disk after a flush re-packs with deltas if size matters.
+- Submodule pointers are not followed (their history lives in another repo).
+
 ## TypeScript
 
 All option and result types are exported:
@@ -457,11 +494,11 @@ import {
     DeleteBranchOptions, CheckoutOptions, MergeOptions,
     CreateTagOptions, ResetOptions, RenameOptions,
     CloneOptions, FetchOptions, PullOptions, PushOptions,
-    LogOptions, ResolveRefOptions, DiffOptions,
+    LogOptions, ResolveRefOptions, DiffOptions, GcOptions,
     // Results
     CommitInfo, FileStatus, BranchInfo, RemoteInfo,
     TagRef, ChangedFile, DiffEntry, MergeResult,
-    ShowResult, RevListOptions, ResetMode,
+    ShowResult, RevListOptions, ResetMode, GcResult,
     MemoryUsage, RepoInfo, Author, OperationLogEntry, OperationStats
 } from 'memory-git';
 ```
@@ -489,6 +526,7 @@ Run `pnpm run benchmark` to reproduce.
 | 200 status / write / add / commit / log cycles | 15107ms | 1013ms | **14.9× faster** |
 | 50× repeated `git log` | 711ms | 39ms | **18.2× faster** |
 | Init + 50 files + commit + branch + merge | 965ms | 104ms | **9.2× faster** |
+| End-to-end `gc` on 500-commit repo (1500 loose objects): native `git gc` in place vs `loadFromDisk + mg.gc() + flush({clean:true})` | 393ms | 1159ms (116 load + 793 gc + 250 flush) | Native wins ~3× on local SSD. Ratio inverts on EFS/NFS — see below |
 
 Three takeaways:
 

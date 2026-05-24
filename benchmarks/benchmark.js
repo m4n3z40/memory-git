@@ -347,6 +347,113 @@ async function benchmarkIncrementalSync() {
     await fs.rm(dstDir, { recursive: true, force: true });
 }
 
+/**
+ * gc on disk (native git) vs gc in memory (MemoryGit pipeline).
+ *
+ * The point of `mg.gc()` is to avoid the small-file IO storm that `git gc`
+ * does against `.git/objects/` on slow filesystems (EFS, NFS, networked
+ * dev-container volumes). The fair comparison is end-to-end:
+ *
+ *   Native:    git gc                                  (in place on disk)
+ *   MemoryGit: loadFromDisk → mg.gc() → flush({clean:true})
+ *
+ * Both produce a packed, prune'd repo on disk. The numbers below run on
+ * the local APFS SSD where native git almost always wins — the wallclock
+ * gap inverts on slow filesystems where each loose-object delete becomes
+ * a network round-trip.
+ */
+async function benchmarkGc() {
+    console.log('\n' + '='.repeat(70));
+    console.log('BENCHMARK: gc on disk (native) vs gc in memory (MemoryGit)');
+    console.log('='.repeat(70));
+
+    const numCommits = 500;
+    const nativeRepo = '/tmp/benchmark-gc-native';
+    const mgRepo = '/tmp/benchmark-gc-memory';
+
+    // Build identical fragmented repos via the git CLI — same loose-object
+    // shape both implementations have to clean up.
+    const seedDisk = async (repoPath) => {
+        await fs.rm(repoPath, { recursive: true, force: true }).catch(() => {});
+        await fs.mkdir(repoPath, { recursive: true });
+        const gitCmd = (cmd) => execSync(cmd, { cwd: repoPath, stdio: 'pipe' });
+        gitCmd('git init -b main');
+        gitCmd('git config user.email "b@b.com"');
+        gitCmd('git config user.name "B"');
+        gitCmd('git config gc.auto 0');  // disable any background packing
+        for (let i = 0; i < numCommits; i++) {
+            await fs.writeFile(path.join(repoPath, `f${i}.txt`), `content-${i}\n`);
+            gitCmd('git add .');
+            gitCmd(`git commit -q -m c${i}`);
+        }
+    };
+
+    const countLooseDisk = async (repoPath) => {
+        const objectsDir = path.join(repoPath, '.git', 'objects');
+        let n = 0;
+        let entries;
+        try { entries = await fs.readdir(objectsDir); } catch { return 0; }
+        for (const name of entries) {
+            if (!/^[0-9a-f]{2}$/.test(name)) continue;
+            try { n += (await fs.readdir(path.join(objectsDir, name))).length; } catch { /* race */ }
+        }
+        return n;
+    };
+
+    await seedDisk(nativeRepo);
+    await seedDisk(mgRepo);
+
+    const looseBefore = await countLooseDisk(nativeRepo);
+
+    // --- Native: git gc in place ---
+    const tNative = process.hrtime.bigint();
+    execSync('git gc --prune=now --quiet', { cwd: nativeRepo, stdio: 'pipe' });
+    const nativeMs = Number(process.hrtime.bigint() - tNative) / 1_000_000;
+    const looseAfterNative = await countLooseDisk(nativeRepo);
+
+    // --- MemoryGit: load → gc → flush({clean:true}) ---
+    const mg = new MemoryGit('gc-bench');
+    const tLoad = process.hrtime.bigint();
+    await mg.loadFromDisk(mgRepo);
+    const loadMs = Number(process.hrtime.bigint() - tLoad) / 1_000_000;
+
+    const tGc = process.hrtime.bigint();
+    const gcResult = await mg.gc();
+    const gcMs = Number(process.hrtime.bigint() - tGc) / 1_000_000;
+
+    const tFlush = process.hrtime.bigint();
+    await mg.flush(null, { clean: true });
+    const flushMs = Number(process.hrtime.bigint() - tFlush) / 1_000_000;
+
+    const mgTotalMs = loadMs + gcMs + flushMs;
+    const looseAfterMg = await countLooseDisk(mgRepo);
+
+    console.log(`\n📦 Both repos: ${numCommits} commits, one new file per commit`);
+    console.log(`   Loose objects before gc:    ${looseBefore}`);
+    console.log(`   Loose objects after gc:     native=${looseAfterNative}, memory-git=${looseAfterMg}`);
+    console.log(`   Reachable OIDs packed (mg): ${gcResult.reachableObjects}`);
+    console.log(`   New pack size (mg):         ${gcResult.packSizeBytes} bytes`);
+
+    console.log(`\n⚡ Wallclock (local APFS SSD):`);
+    console.log(`   Native git gc:           ${nativeMs.toFixed(2)}ms   (single in-place pass)`);
+    console.log(`   memory-git pipeline:     ${mgTotalMs.toFixed(2)}ms   (load ${loadMs.toFixed(2)} + gc ${gcMs.toFixed(2)} + flush ${flushMs.toFixed(2)})`);
+
+    const ratio = mgTotalMs / nativeMs;
+    if (ratio < 1) {
+        console.log(`\n   memory-git is ${(1 / ratio).toFixed(2)}× faster end-to-end.`);
+    } else {
+        console.log(`\n   On this fast SSD, native git wins by ${ratio.toFixed(2)}× — expected.`);
+        console.log(`   The pipeline pays a one-time loadFromDisk + a buffered packObjects.`);
+    }
+    console.log(`   On EFS/NFS the equation inverts: each loose-object unlink in native`);
+    console.log(`   git gc becomes a network round-trip, so a single round of small-file`);
+    console.log(`   reads in loadFromDisk + one batched pack write beats thousands of`);
+    console.log(`   metadata ops in place.`);
+
+    await fs.rm(nativeRepo, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(mgRepo, { recursive: true, force: true }).catch(() => {});
+}
+
 async function benchmarkLoadFromDisk() {
     console.log('\n' + '='.repeat(70));
     console.log('BENCHMARK: Loading Existing Repository');
@@ -834,6 +941,9 @@ async function main() {
 
     // Agent-style workflow (the killer use case for exec())
     await benchmarkAgentWorkflow();
+
+    // In-memory gc (pack + prune)
+    await benchmarkGc();
     
     console.log('\n' + '='.repeat(70));
     console.log('CONCLUSION');

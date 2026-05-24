@@ -350,6 +350,32 @@ export interface RevListOptions {
     ref?: string;
 }
 
+export interface GcOptions {
+    /**
+     * Consolidate existing packfiles into the new pack and remove the old
+     * `.pack`/`.idx`/`.rev`/`.mtimes`/`.bitmap` files (default: true). When
+     * false, only loose objects are repacked and prior packs are left in place.
+     */
+    consolidatePacks?: boolean;
+    /** Include remote-tracking refs (refs/remotes/) in the reachability set (default: true). */
+    includeRemoteRefs?: boolean;
+    /** Include tags (annotated + lightweight) in the reachability set (default: true). */
+    includeTags?: boolean;
+}
+
+export interface GcResult {
+    /** Distinct OIDs walked from refs and packed into the new pack. */
+    reachableObjects: number;
+    /** Loose object files removed from `.git/objects/[0-9a-f]{2}/`. */
+    looseDeleted: number;
+    /** Stale pack files removed (counts each `.pack`; sibling `.idx`/`.rev`/… removed with it but not counted separately). */
+    packsRemoved: number;
+    /** Filename of the new pack (e.g. `pack-<sha>.pack`). Empty when there were no reachable objects. */
+    packFilename: string;
+    /** Byte size of the new pack as written to memfs. */
+    packSizeBytes: number;
+}
+
 /** Options accepted by exec/execStream */
 export interface ExecOptions {
     /** Abort the in-flight operation. Throws AbortError on abort. */

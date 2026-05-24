@@ -35,6 +35,7 @@ import lsFiles from './ls-files.js';
 import revList from './rev-list.js';
 import showRef from './show-ref.js';
 import describe from './describe.js';
+import gc from './gc.js';
 
 const REGISTRY = new Map<string, Command>();
 function register(cmd: Command): void {
@@ -67,6 +68,7 @@ register(lsFiles);
 register(revList);
 register(showRef);
 register(describe);
+register(gc);
 
 /** Resolve a subcommand by name (or alias). Returns `undefined` if unknown. */
 export function getCommand(name: string): Command | undefined {

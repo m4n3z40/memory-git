@@ -62,6 +62,8 @@ import type {
     RevListOptions,
     ExecOptions,
     OperationListener,
+    GcOptions,
+    GcResult,
 } from './types.js';
 
 export type {
@@ -103,6 +105,8 @@ export type {
     RevListOptions,
     ExecOptions,
     OperationListener,
+    GcOptions,
+    GcResult,
 } from './types.js';
 
 /** Internal: shape used by the stash stack. Not part of the public surface. */
@@ -1861,6 +1865,263 @@ export class MemoryGit {
             this._logOperation('flush', { targetPath }, null, error as Error);
             throw error;
         }
+    }
+
+    /**
+     * In-memory garbage collection. Enumerates every OID reachable from refs
+     * (branches + remote-tracking branches + tags + HEAD), repacks them into
+     * a single new packfile under `.git/objects/pack/`, then deletes the now-
+     * redundant loose objects (and, by default, the prior packs they came from).
+     *
+     * Does NOT touch disk. Call `flush({clean: true})` afterwards to propagate
+     * the deletions and the new pack to the on-disk repo. The `clean` flag is
+     * required because removing loose objects on disk is a deletion the
+     * incremental flush would otherwise skip.
+     *
+     * Unreachable objects are dropped — equivalent to `git gc --prune=now`.
+     * isomorphic-git has no reflog, so there is no grace period.
+     *
+     * Memory ceiling: `git.packObjects` buffers the whole new pack in RAM
+     * before writing. Peak ≈ packed size of all reachable objects.
+     */
+    async gc(options: GcOptions = {}): Promise<GcResult> {
+        this._assertWritable('gc');
+        const consolidatePacks = options.consolidatePacks !== false;
+        const includeRemoteRefs = options.includeRemoteRefs !== false;
+        const includeTags = options.includeTags !== false;
+
+        try {
+            const reachable = await this._collectReachableOids({ includeRemoteRefs, includeTags });
+            const oids = [...reachable];
+
+            const gitdir = pathNode.posix.join(this.dir, '.git');
+            const packDir = pathNode.posix.join(gitdir, 'objects', 'pack');
+
+            // Snapshot pre-existing pack basenames so we can decide what to
+            // remove after writing the new one. We list before packObjects
+            // because the new pack file lands in the same directory.
+            let priorPackBasenames: string[] = [];
+            if (consolidatePacks) {
+                try {
+                    const entries = this.fs.readdirSync(packDir) as string[];
+                    priorPackBasenames = entries
+                        .filter(n => /^pack-[0-9a-f]+\.pack$/.test(n))
+                        .map(n => n.replace(/\.pack$/, ''));
+                } catch (err) {
+                    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+                }
+            }
+
+            let packFilename = '';
+            let packSizeBytes = 0;
+
+            if (oids.length > 0) {
+                const result = await git.packObjects({
+                    fs: this.fs,
+                    gitdir,
+                    oids,
+                    write: true,
+                });
+                packFilename = result.filename;
+
+                // packObjects writes the .pack but not the .idx. Without an
+                // index, isomorphic-git can't read objects from it — so the
+                // unlink sweep below would orphan everything in the new pack.
+                // indexPack resolves filepath relative to `dir` (working tree),
+                // not `gitdir`. Mismatch the prefix and it reads null bytes
+                // and crashes inside GitPackIndex.fromPack.
+                await git.indexPack({
+                    fs: this.fs,
+                    dir: this.dir,
+                    filepath: pathNode.posix.join('.git', 'objects', 'pack', packFilename),
+                });
+
+                try {
+                    const stat = this.fs.statSync(pathNode.posix.join(packDir, packFilename));
+                    packSizeBytes = (stat as { size?: number }).size ?? 0;
+                } catch {
+                    // Pack file vanished between write and stat — shouldn't happen
+                    // with memfs but don't fail the whole gc over a size report.
+                }
+            }
+
+            const looseDeleted = this._sweepLooseObjects(gitdir);
+
+            let packsRemoved = 0;
+            if (consolidatePacks && oids.length > 0) {
+                const newBase = packFilename.replace(/\.pack$/, '');
+                for (const base of priorPackBasenames) {
+                    if (base === newBase) continue;
+                    packsRemoved += this._removePackFamily(packDir, base);
+                }
+            }
+
+            const result: GcResult = {
+                reachableObjects: oids.length,
+                looseDeleted,
+                packsRemoved,
+                packFilename,
+                packSizeBytes,
+            };
+            this._logOperation('gc', { options }, { success: true, ...result });
+            return result;
+        } catch (error) {
+            this._logOperation('gc', { options }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Walk every ref (branches, remote-tracking branches, tags, HEAD) and
+     * collect every OID reachable through commits, trees, and annotated tags.
+     * Memoized in the returned Set — each object is visited at most once.
+     * Submodule pointers (TreeEntry.type === 'commit') are not recursed into.
+     */
+    private async _collectReachableOids(
+        opts: { includeRemoteRefs: boolean; includeTags: boolean },
+    ): Promise<Set<string>> {
+        const reachable = new Set<string>();
+        const gitdir = pathNode.posix.join(this.dir, '.git');
+        const args = { fs: this.fs, dir: this.dir };
+
+        const tipOids = new Set<string>();
+        const addTip = async (ref: string) => {
+            try {
+                const oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref });
+                tipOids.add(oid);
+            } catch {
+                // Ref vanished or unreachable; ignore.
+            }
+        };
+
+        for (const b of await git.listBranches(args)) await addTip(`refs/heads/${b}`);
+        if (opts.includeRemoteRefs) {
+            for (const remote of await git.listRemotes(args)) {
+                for (const b of await git.listBranches({ ...args, remote: remote.remote })) {
+                    await addTip(`refs/remotes/${remote.remote}/${b}`);
+                }
+            }
+        }
+        if (opts.includeTags) {
+            for (const t of await git.listTags(args)) await addTip(`refs/tags/${t}`);
+        }
+        await addTip('HEAD');
+
+        // Peel annotated tags: a tag object points at a commit/tree/blob and
+        // both ends must end up in the reachable set.
+        const commitFrontier: string[] = [];
+        for (const oid of tipOids) {
+            const { type } = await git.readObject({ fs: this.fs, gitdir, oid, format: 'parsed' });
+            reachable.add(oid);
+            if (type === 'tag') {
+                const { tag } = await git.readTag({ fs: this.fs, gitdir, oid });
+                reachable.add(tag.object);
+                if (tag.type === 'commit') commitFrontier.push(tag.object);
+                else if (tag.type === 'tree') await this._walkTree(gitdir, tag.object, reachable);
+                // blob tag target needs no further walking.
+            } else if (type === 'commit') {
+                commitFrontier.push(oid);
+            } else if (type === 'tree') {
+                await this._walkTree(gitdir, oid, reachable);
+            }
+        }
+
+        // Walk commit graph breadth-first via parents, collecting each commit's
+        // tree. Iterative to keep the call stack bounded on long histories.
+        const visitedCommits = new Set<string>();
+        const queue = [...commitFrontier];
+        while (queue.length) {
+            const oid = queue.shift()!;
+            if (visitedCommits.has(oid)) continue;
+            visitedCommits.add(oid);
+            reachable.add(oid);
+            const { commit } = await git.readCommit({ fs: this.fs, gitdir, oid });
+            await this._walkTree(gitdir, commit.tree, reachable);
+            for (const parent of commit.parent || []) queue.push(parent);
+        }
+
+        return reachable;
+    }
+
+    /**
+     * Recursively add every tree and blob OID reachable from `treeOid` to
+     * `acc`. Submodule entries (type === 'commit') are added as bare OIDs
+     * but not followed (the submodule's history lives in another repo).
+     */
+    private async _walkTree(gitdir: string, treeOid: string, acc: Set<string>): Promise<void> {
+        if (acc.has(treeOid)) return;
+        acc.add(treeOid);
+        const { tree } = await git.readTree({ fs: this.fs, gitdir, oid: treeOid });
+        for (const entry of tree) {
+            if (entry.type === 'tree') {
+                await this._walkTree(gitdir, entry.oid, acc);
+            } else if (entry.type === 'blob') {
+                acc.add(entry.oid);
+            }
+            // entry.type === 'commit' ⇒ submodule pointer, intentionally skipped.
+        }
+    }
+
+    /**
+     * Delete every loose object file under `.git/objects/[0-9a-f]{2}/`. Safe
+     * to call after `git.packObjects` + `git.indexPack`: any reachable loose
+     * object is now duplicated in the new pack, and unreachable ones are
+     * dropped (this is the prune step). Returns the file count.
+     */
+    private _sweepLooseObjects(gitdir: string): number {
+        const objectsDir = pathNode.posix.join(gitdir, 'objects');
+        let deleted = 0;
+        let entries: string[];
+        try {
+            entries = this.fs.readdirSync(objectsDir) as string[];
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+            throw err;
+        }
+        for (const name of entries) {
+            if (!/^[0-9a-f]{2}$/.test(name)) continue;
+            const subdir = pathNode.posix.join(objectsDir, name);
+            let files: string[];
+            try {
+                files = this.fs.readdirSync(subdir) as string[];
+            } catch (err) {
+                if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+                throw err;
+            }
+            for (const file of files) {
+                try {
+                    this.fs.unlinkSync(pathNode.posix.join(subdir, file));
+                    deleted += 1;
+                } catch (err) {
+                    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+                }
+            }
+            try {
+                this.fs.rmdirSync(subdir);
+            } catch {
+                // Directory may not be empty if a write raced; leave it.
+            }
+        }
+        return deleted;
+    }
+
+    /**
+     * Remove every sibling of a pack: `.pack`, `.idx`, `.rev`, `.mtimes`,
+     * `.bitmap`. Returns 1 if the `.pack` itself was unlinked (the headline
+     * count for `packsRemoved`), 0 otherwise.
+     */
+    private _removePackFamily(packDir: string, basename: string): number {
+        let packRemoved = 0;
+        for (const ext of ['.pack', '.idx', '.rev', '.mtimes', '.bitmap']) {
+            const filepath = pathNode.posix.join(packDir, basename + ext);
+            try {
+                this.fs.unlinkSync(filepath);
+                if (ext === '.pack') packRemoved = 1;
+            } catch (err) {
+                if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+            }
+        }
+        return packRemoved;
     }
 
     /**
