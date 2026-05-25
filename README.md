@@ -510,6 +510,35 @@ Reachability is computed from local branches, remote-tracking branches, tags, an
 - No custom delta compression — the resulting pack may be larger than what `git gc` produces natively. Re-running `git gc` on disk after a flush re-packs with deltas if size matters.
 - Submodule pointers are not followed (their history lives in another repo).
 
+## Memory footprint on Node 26+
+
+Node v26 introduced a regression where `new Blob([buffer]).stream()` pins its
+input buffer in V8 *eternal handles* and never releases it. isomorphic-git uses
+exactly that call to compress every object it writes (`add` / `commit` / `merge`
+/ `clone`), so on Node 26 a long-lived process leaks roughly one object-sized
+buffer per write. The symptom is **multi-GB RSS while the V8 heap and
+`getMemoryUsage()` stay tiny** — the retained memory is native (off-heap) and
+invisible to the volume accounting. Node 20/22/24/25 are unaffected, and reads
+never trigger it (the inflate path always uses pako).
+
+MemoryGit works around this automatically: on the affected Node versions it
+makes isomorphic-git fall back to [pako](https://github.com/nodeca/pako)
+(pure-JS, no leak) for compression. The workaround primes isomorphic-git's
+feature detection once at startup (`init` / `loadFromDisk` / `clone` await it)
+and leaves `globalThis.CompressionStream` untouched for the rest of your process.
+
+Override via the `MEMORY_GIT_COMPRESSION` env var:
+
+| Value | Effect |
+|---|---|
+| _unset_ (default) | Auto: force pako only on Node major ≥ 26 |
+| `pako` | Force pako on any Node version |
+| `native` | Never touch compression (opt out — keeps native `CompressionStream`) |
+
+`primeSafeCompression()` and `shouldForcePako()` are exported if you need to
+prime manually (e.g. before bypassing the standard entry points) or to inspect
+the decision.
+
 ## TypeScript
 
 All option and result types are exported:

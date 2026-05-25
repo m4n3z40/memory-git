@@ -21,6 +21,9 @@ import {
 } from './disk-sync.js';
 import { LazyState, wrapLazyFs } from './lazy-fs.js';
 import { getCommand, type Command } from './commands/index.js';
+import { primeSafeCompression } from './compression-fix.js';
+
+export { primeSafeCompression, shouldForcePako } from './compression-fix.js';
 
 type MemFs = ReturnType<typeof createFsFromVolume>;
 
@@ -534,6 +537,7 @@ export class MemoryGit {
      */
     async init(options: InitOptions = {}): Promise<boolean> {
         this._assertWritable('init');
+        await primeSafeCompression();
         const defaultBranch = options.defaultBranch ?? 'main';
         const bare = options.bare ?? false;
         try {
@@ -556,6 +560,7 @@ export class MemoryGit {
      */
     async loadFromDisk(sourcePath: string, options: LoadFromDiskOptions = {}): Promise<number> {
         this._assertWritable('loadFromDisk');
+        await primeSafeCompression();
         try {
             const resolvedSource = pathNode.resolve(sourcePath);
             const respectGitignore = options.respectGitignore !== false;
@@ -2917,6 +2922,7 @@ export class MemoryGit {
      */
     async clone(url: string, options: CloneOptions = {}): Promise<boolean> {
         this._assertWritable('clone');
+        await primeSafeCompression();
         try {
             this._checkSignal(options.signal);
             this.fs.mkdirSync(this.dir, { recursive: true });
