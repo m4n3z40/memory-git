@@ -90,9 +90,10 @@ await mg.exec('git config user.name "Agent"');
 | `branch` | (list), `<name>` (create), `-d/-D <name>`, `-m <old> <new>`, `--show-current` |
 | `checkout` | `<ref>`, `-b <new>`, `-f`, `-- <files...>` |
 | `merge` | `<branch>`, `--no-ff`, `--ff-only`, `-m <msg>`, `--abort`, `-X/--strategy-option=ours\|theirs`, `--allow-unrelated-histories`, `--no-edit` |
-| `tag` | `<name>`, `-a -m <msg>`, `-d <name>`, `-f`, `-l` |
+| `tag` | `<name>`, `-a -m <msg>`, `-d <name>`, `-f`, `-l`, `--points-at <ref>` |
 | `show-ref` | `--tags`, `-d/--dereference` |
 | `describe` | `--exact-match --tags <ref>` |
+| `pack-refs` | `--all` (default behavior), `--prune` (always on) |
 | `reset` | `--soft`, `--mixed`, `--hard`, `<ref>`, `-- <files...>` |
 | `clone` | `<url>`, `-b/--branch <ref>`, `--depth <n>`, `--single-branch`, `--no-checkout` |
 | `fetch` | `[<remote>]`, `--prune`, `--tags`, `--depth <n>` |

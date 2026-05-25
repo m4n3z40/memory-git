@@ -36,6 +36,7 @@ import revList from './rev-list.js';
 import showRef from './show-ref.js';
 import describe from './describe.js';
 import gc from './gc.js';
+import packRefs from './pack-refs.js';
 
 const REGISTRY = new Map<string, Command>();
 function register(cmd: Command): void {
@@ -69,6 +70,7 @@ register(revList);
 register(showRef);
 register(describe);
 register(gc);
+register(packRefs);
 
 /** Resolve a subcommand by name (or alias). Returns `undefined` if unknown. */
 export function getCommand(name: string): Command | undefined {
