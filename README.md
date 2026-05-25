@@ -202,10 +202,12 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | Method | Description |
 |--------|-------------|
 | `createTag(name, refOrOptions?, options?)` | Lightweight or annotated. `{ref, annotated, message, force}` |
-| `listTags()` | Tag names |
+| `listTags(options?)` | Tag names. `{limit, offset, reverse}` for pagination |
 | `deleteTag(name)` | `git tag -d` |
-| `describeExact(ref?)` | `git describe --exact-match --tags` |
-| `showTagRefs()` | Resolves annotated tags to commit OIDs |
+| `describeExact(ref?, options?)` | `git describe --exact-match --tags`. `{skipPeel}` skips the per-loose-tag `readTag` peel for ~5× faster cold path on lightweight-only repos |
+| `tagsPointingAt(ref?, options?)` | `git tag --points-at`. `{limit, skipPeel}` |
+| `showTagRefs(options?)` | Resolves annotated tags to commit OIDs. `{limit, reverse, skipPeel}` — paginated listings short-circuit and only resolve the N tags requested instead of scanning every tag |
+| `packRefs()` | `git pack-refs --all`. Coalesces every loose `refs/{heads,tags,remotes}/*` into a single `.git/packed-refs` (annotated tags get peeled `^<commit>` lines inline). On a repo with thousands of loose tags this turns the cold path of any tag-iterating call from O(N) file reads into a single ~80 KB read. Call from `flush` (use `flush({clean:true})` so the loose files actually disappear from disk) or a periodic maintenance job — packing on every write rebuilds the whole file |
 
 ### Remotes
 
