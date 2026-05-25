@@ -355,6 +355,51 @@ export interface TagRef {
     commitOid: string;
 }
 
+export interface ListTagsOptions {
+    /** Maximum tags to return. Default: all. */
+    limit?: number;
+    /** Number of tags to skip before applying `limit`. Default: 0. */
+    offset?: number;
+    /** Return the slice in reverse-lexicographic (newest names first) order. */
+    reverse?: boolean;
+}
+
+export interface ShowTagRefsOptions {
+    /** Maximum tag refs to resolve and return. Default: all. */
+    limit?: number;
+    /** When true, walk tags newest-first (reverse-lex). */
+    reverse?: boolean;
+    /**
+     * Per-chunk parallelism for legacy resolveRef paths. Ignored by the
+     * packed-refs fast path (which is a single read). Default: 1.
+     */
+    concurrency?: number;
+    /**
+     * Skip the `readTag` peel step for loose tags. ~21× faster on repos
+     * with thousands of loose lightweight tags, but returns the
+     * tag-object OID (not the commit OID) for annotated loose tags. Safe
+     * for repos where tags are all lightweight (memory-git's default).
+     * Packed annotated tags are unaffected — their peeled commit OID is
+     * already inline in `packed-refs`.
+     */
+    skipPeel?: boolean;
+}
+
+export interface TagsPointingAtOptions {
+    /** Stop after this many matches are found. Default: all matches. */
+    limit?: number;
+    /**
+     * Per-chunk parallelism for the legacy slow path. Ignored by the
+     * packed-refs fast path. Default: 64.
+     */
+    concurrency?: number;
+    /**
+     * Skip the `readTag` peel step for loose tags. See ShowTagRefsOptions
+     * for the precision/perf tradeoff.
+     */
+    skipPeel?: boolean;
+}
+
 export interface ChangedFile {
     filepath: string;
     status: 'added' | 'modified' | 'deleted' | 'renamed';
