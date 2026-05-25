@@ -6,6 +6,7 @@ import pathNode from 'path';
 import { parse as shellParse } from 'shell-quote';
 import ignore from 'ignore';
 
+import { MemoizedAsync } from './memoized-async.js';
 import { OperationLog } from './operation-log.js';
 import {
     realPathExists,
@@ -1768,18 +1769,22 @@ export class MemoryGit {
     }
 
     /**
-     * Lazily loaded `tagName → commitOid` cache. Populated by the first
-     * call to `_loadAllTagOids`; invalidated on every tag write via
-     * `_invalidateTagCache`. While populated, all `tagsPointingAt` /
-     * `describeExact` / `showTagRefs` calls hit memory only — no
-     * `fs.read`, no parse — so the 2nd-Nth lookup over the same sandbox
-     * lifetime is essentially free.
+     * Lazily loaded `tagName → commitOid` cache with concurrent-load
+     * deduplication. Populated by the first call to `_loadAllTagOids`;
+     * invalidated on every tag write via `_invalidateTagCache`. While
+     * populated, all `tagsPointingAt` / `describeExact` / `showTagRefs`
+     * calls hit memory only — no `fs.read`, no parse — so the 2nd-Nth
+     * lookup over the same sandbox lifetime is essentially free.
+     *
+     * Concurrent callers (e.g. `Promise.all([describeExact(), tagsPointingAt()])`
+     * on a cold instance) share a single in-flight load instead of each
+     * doing the full ~hundreds-of-tags I/O.
      */
-    private _tagOidsCache: Map<string, string> | null = null;
+    private _tagOidsCache = new MemoizedAsync<Map<string, string>>();
 
     /** Drop the cached tag→commit map. Call after any write touching tags. */
     private _invalidateTagCache(): void {
-        this._tagOidsCache = null;
+        this._tagOidsCache.invalidate();
     }
 
     /**
@@ -1819,8 +1824,11 @@ export class MemoryGit {
      * matters.
      */
     private async _loadAllTagOids(opts: { skipPeel?: boolean } = {}): Promise<Map<string, string>> {
-        if (this._tagOidsCache !== null) return this._tagOidsCache;
+        return this._tagOidsCache.get(() => this._doLoadAllTagOids(opts));
+    }
 
+    /** Underlying I/O for `_loadAllTagOids` (cache + dedup live in `_tagOidsCache`). */
+    private async _doLoadAllTagOids(opts: { skipPeel?: boolean }): Promise<Map<string, string>> {
         const result = new Map<string, string>();
         const gitDir = `${this.dir}/.git`;
 
@@ -1901,7 +1909,6 @@ export class MemoryGit {
             }
         }
 
-        this._tagOidsCache = result;
         return result;
     }
 
@@ -2020,7 +2027,7 @@ export class MemoryGit {
             // list comes from listTags/readdir), then resolve only that
             // slice. Avoids paying the full _loadAllTagOids cost (~2700
             // file reads) when the caller wanted N=10.
-            if (opts.limit != null && opts.limit < 100 && this._tagOidsCache === null) {
+            if (opts.limit != null && opts.limit < 100 && this._tagOidsCache.peek() === undefined) {
                 const names = await this.listTags({ limit: opts.limit, reverse: opts.reverse });
                 const result: TagRef[] = [];
                 const CONCURRENCY = 64;
