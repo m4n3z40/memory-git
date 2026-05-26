@@ -24,6 +24,7 @@ import { createFsFromVolume, Volume } from 'memfs';
 import ignore from 'ignore';
 import {
     copyDiskToMemoryIncremental,
+    copyMemoryToDisk,
     copyMemoryToDiskIncremental,
     listFilesRecursive,
     type FileFingerprint,
@@ -377,5 +378,94 @@ describe('listFilesRecursive symlink resilience (unit)', () => {
         expect(files).toContain('keep.txt');
         expect(files).not.toContain('gone.txt');
         spy.mockRestore();
+    });
+});
+
+/**
+ * Regression coverage for the dangling-symlink crash on the flush path
+ * (memory-git@3.10.4): copyMemoryToDisk / copyMemoryToDiskIncremental used
+ * statSync, which follows symlinks. A dead symlink in the in-memory tree
+ * (e.g. a node_modules pointing at an emptyDir cache wiped on pod restart)
+ * made statSync throw ENOENT and abort the whole flush. We now lstat and
+ * replicate the link itself instead of resolving it.
+ */
+describe('copyMemoryToDisk symlink resilience (unit)', () => {
+    let tmpDir: string;
+
+    beforeEach(async () => {
+        tmpDir = await fsRealAsync.mkdtemp(path.join(os.tmpdir(), 'mg-sym-'));
+    });
+    afterEach(async () => {
+        await fsRealAsync.rm(tmpDir, { recursive: true, force: true });
+    });
+
+    it('copyMemoryToDisk: replicates a dangling symlink instead of throwing', async () => {
+        const fs = createFsFromVolume(new Volume());
+        fs.mkdirSync('/repo', { recursive: true });
+        fs.writeFileSync('/repo/README.md', '# test');
+        fs.symlinkSync('/does/not/exist', '/repo/node_modules');
+
+        // Pre-fix this rejected with ENOENT on node_modules.
+        const count = await copyMemoryToDisk(fs as any, '/repo', tmpDir);
+
+        // The regular file is written…
+        expect(await fsRealAsync.readFile(path.join(tmpDir, 'README.md'), 'utf8')).toBe('# test');
+        // …and the dead symlink is replicated as a symlink (not resolved/crashed).
+        const ls = await fsRealAsync.lstat(path.join(tmpDir, 'node_modules'));
+        expect(ls.isSymbolicLink()).toBe(true);
+        expect(await fsRealAsync.readlink(path.join(tmpDir, 'node_modules'))).toBe('/does/not/exist');
+        expect(count).toBe(2);
+    });
+
+    it('copyMemoryToDisk: replicates a live symlink without resolving its target', async () => {
+        const fs = createFsFromVolume(new Volume());
+        fs.mkdirSync('/repo/real', { recursive: true });
+        fs.writeFileSync('/repo/real/inner.js', 'code');
+        fs.symlinkSync('/repo/real', '/repo/link');
+
+        await copyMemoryToDisk(fs as any, '/repo', tmpDir);
+
+        const ls = await fsRealAsync.lstat(path.join(tmpDir, 'link'));
+        expect(ls.isSymbolicLink()).toBe(true);
+        expect(await fsRealAsync.readlink(path.join(tmpDir, 'link'))).toBe('/repo/real');
+        // The link must not have been followed and copied as a directory.
+        await expect(fsRealAsync.access(path.join(tmpDir, 'link/inner.js')))
+            .rejects.toMatchObject({ code: 'ENOENT' });
+    });
+
+    it('copyMemoryToDiskIncremental: replicates a dangling symlink and tracks it in seen', async () => {
+        const fs = createFsFromVolume(new Volume());
+        fs.mkdirSync('/repo', { recursive: true });
+        fs.symlinkSync('/gone/cache', '/repo/node_modules');
+
+        const snapshot = new Map<string, FileFingerprint>();
+        const seen = new Set<string>();
+        const result = await copyMemoryToDiskIncremental(fs as any, '/repo', tmpDir, '', snapshot, seen);
+
+        const ls = await fsRealAsync.lstat(path.join(tmpDir, 'node_modules'));
+        expect(ls.isSymbolicLink()).toBe(true);
+        expect(await fsRealAsync.readlink(path.join(tmpDir, 'node_modules'))).toBe('/gone/cache');
+        // In `seen` (so `clean` won't delete it) but NOT in `snapshot` (no content hash).
+        expect(seen.has('node_modules')).toBe(true);
+        expect(snapshot.has('node_modules')).toBe(false);
+        expect(result.written).toBe(1);
+    });
+
+    it('copyMemoryToDiskIncremental: re-flush skips an already-correct symlink', async () => {
+        const fs = createFsFromVolume(new Volume());
+        fs.mkdirSync('/repo', { recursive: true });
+        fs.symlinkSync('/gone/cache', '/repo/node_modules');
+
+        const snapshot = new Map<string, FileFingerprint>();
+        const seen1 = new Set<string>();
+        await copyMemoryToDiskIncremental(fs as any, '/repo', tmpDir, '', snapshot, seen1);
+
+        const seen2 = new Set<string>();
+        const result = await copyMemoryToDiskIncremental(fs as any, '/repo', tmpDir, '', snapshot, seen2);
+
+        // Link target already matches → no rewrite.
+        expect(result.written).toBe(0);
+        expect(result.skipped).toBe(1);
+        expect(seen2.has('node_modules')).toBe(true);
     });
 });

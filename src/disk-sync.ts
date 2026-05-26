@@ -66,6 +66,34 @@ export async function realPathExists(filepath: string): Promise<boolean> {
 }
 
 /**
+ * Replicate an in-memory symlink onto disk faithfully (readlink + symlink)
+ * rather than following it. `statSync`/`readFileSync` resolve the link target
+ * and throw ENOENT on a dangling link (classic case: a `node_modules`
+ * pointing at an ephemeral cache that was wiped) — which would abort the whole
+ * flush. Replicating the link round-trips it correctly and never resolves it.
+ * Returns true if the on-disk link was (re)written.
+ */
+async function syncSymlinkToDisk(
+    fs: MemFs,
+    memoryEntryPath: string,
+    realEntryPath: string,
+): Promise<boolean> {
+    const target = fs.readlinkSync(memoryEntryPath) as string;
+    let current: string | undefined;
+    try {
+        current = (await fsRealAsync.readlink(realEntryPath)) as string;
+    } catch {
+        current = undefined;
+    }
+    if (current === target) return false;
+    // Replace whatever is at the destination (stale link, file, or directory)
+    // so symlink() can't EEXIST; force ignores a missing destination.
+    await fsRealAsync.rm(realEntryPath, { recursive: true, force: true });
+    await fsRealAsync.symlink(target, realEntryPath);
+    return true;
+}
+
+/**
  * True iff a node fs error is ENOENT — file/dir vanished. We use this in the
  * incremental disk→memory walk to tolerate a concurrent mutator (native git
  * gc/repack/prune deleting object dirs, branch updates rotating refs) without
@@ -199,7 +227,21 @@ export async function copyMemoryToDisk(
         const realEntryPath = pathNode.join(realPath, entry);
         const entryRel = relPath ? pathNode.posix.join(relPath, entry) : entry;
 
-        const stat = fs.statSync(memoryEntryPath);
+        // lstatSync (not statSync) so a dangling symlink is observed as a link
+        // rather than throwing ENOENT on its missing target.
+        let stat;
+        try {
+            stat = fs.lstatSync(memoryEntryPath);
+        } catch (err) {
+            // Entry vanished between readdir and lstat — skip it.
+            if (isENOENT(err)) return 0;
+            throw err;
+        }
+
+        if (stat.isSymbolicLink()) {
+            await syncSymlinkToDisk(fs, memoryEntryPath, realEntryPath);
+            return 1;
+        }
 
         if (stat.isDirectory()) {
             const dirExists = await realPathExists(realEntryPath);
@@ -342,7 +384,25 @@ export async function copyMemoryToDiskIncremental(
         const realEntryPath = pathNode.join(realPath, entry);
         const entryRel = relPath ? pathNode.posix.join(relPath, entry) : entry;
 
-        const stat = fs.statSync(memoryEntryPath);
+        // lstatSync (not statSync) so a dangling symlink is observed as a link
+        // rather than throwing ENOENT on its missing target.
+        let stat;
+        try {
+            stat = fs.lstatSync(memoryEntryPath);
+        } catch (err) {
+            // Entry vanished between readdir and lstat — skip it.
+            if (isENOENT(err)) return { written: 0, skipped: 0 };
+            throw err;
+        }
+
+        if (stat.isSymbolicLink()) {
+            // Replicate the link itself; never resolve it (dangling => ENOENT).
+            // Tracked in `seen` so a `clean` flush won't delete it, but kept out
+            // of `snapshot` (it has no content fingerprint).
+            seen.add(entryRel);
+            const wrote = await syncSymlinkToDisk(fs, memoryEntryPath, realEntryPath);
+            return wrote ? { written: 1, skipped: 0 } : { written: 0, skipped: 1 };
+        }
 
         if (stat.isDirectory()) {
             const dirExists = await realPathExists(realEntryPath);
