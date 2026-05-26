@@ -544,6 +544,7 @@ export class MemoryGit {
             this.fs.mkdirSync(this.dir, { recursive: true });
             await git.init({ fs: this.fs, dir: this.dir, defaultBranch, bare });
             this.isInitialized = true;
+            this._invalidateBranchCaches();
             this._logOperation('init', { dir: this.dir, defaultBranch, bare }, { success: true });
             return true;
         } catch (error) {
@@ -591,8 +592,9 @@ export class MemoryGit {
             }
             // Likewise the lazy index — paths in it point at the old source.
             if (this._lazy) this._lazyState.reset();
-            // And the tag cache — refs from the prior source are stale now.
+            // And the tag + branch caches — refs from the prior source are stale now.
             this._invalidateTagCache();
+            this._invalidateBranchCaches();
             this.realDir = resolvedSource;
 
             let fileCount: number;
@@ -1084,6 +1086,7 @@ export class MemoryGit {
         this._assertWritable('createBranch');
         try {
             await git.branch({ fs: this.fs, dir: this.dir, ref: branchName });
+            this._invalidateBranchCaches();
             this._logOperation('createBranch', { branchName }, { success: true });
             return true;
         } catch (error) {
@@ -1101,7 +1104,7 @@ export class MemoryGit {
         this._assertWritable('deleteBranch');
         try {
             if (!options.force) {
-                const current = await git.currentBranch({ fs: this.fs, dir: this.dir });
+                const current = await this._getCurrentBranch();
                 if (current && current !== branchName) {
                     try {
                         const targetOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: branchName });
@@ -1123,6 +1126,7 @@ export class MemoryGit {
                 }
             }
             await git.deleteBranch({ fs: this.fs, dir: this.dir, ref: branchName });
+            this._invalidateBranchCaches();
             this._logOperation('deleteBranch', { branchName, options }, { success: true });
             return true;
         } catch (error) {
@@ -1140,6 +1144,7 @@ export class MemoryGit {
         this._assertWritable('renameBranch');
         try {
             await git.renameBranch({ fs: this.fs, dir: this.dir, ref: newName, oldref: oldName });
+            this._invalidateBranchCaches();
             this._logOperation('renameBranch', { oldName, newName }, { success: true });
             return true;
         } catch (error) {
@@ -1169,6 +1174,8 @@ export class MemoryGit {
             // Workdir was rewritten from the target tree — anything we'd tracked as dirty
             // is gone (unless this was a path-restricted checkout, but conservatively clear all).
             this._dirtyFiles.clear();
+            // HEAD moved (and -b may have added a branch) — drop the branch caches.
+            this._invalidateBranchCaches();
             this._logOperation('checkout', { branchName, options }, { success: true });
             return true;
         } catch (error) {
@@ -1183,14 +1190,16 @@ export class MemoryGit {
      */
     async listBranches(): Promise<BranchInfo[]> {
         try {
-            const branches = await git.listBranches({ fs: this.fs, dir: this.dir });
-            const current = await git.currentBranch({ fs: this.fs, dir: this.dir });
-            
+            const [branches, current] = await Promise.all([
+                this._getBranchNames(),
+                this._getCurrentBranch(),
+            ]);
+
             const result = branches.map(branch => ({
                 name: branch,
                 current: branch === current
             }));
-            
+
             this._logOperation('listBranches', {}, { success: true, branches: result });
             return result;
         } catch (error) {
@@ -1205,9 +1214,9 @@ export class MemoryGit {
      */
     async currentBranch(): Promise<string | undefined> {
         try {
-            const branch = await git.currentBranch({ fs: this.fs, dir: this.dir });
+            const branch = await this._getCurrentBranch();
             this._logOperation('currentBranch', {}, { success: true, branch });
-            return branch || undefined;
+            return branch;
         } catch (error) {
             this._logOperation('currentBranch', {}, null, error as Error);
             throw error;
@@ -1472,7 +1481,7 @@ export class MemoryGit {
             if (options?.abbrevRef) {
                 // For symbolic refs (HEAD), resolve to branch name without prefix
                 if (ref === 'HEAD') {
-                    const branch = await git.currentBranch({ fs: this.fs, dir: this.dir });
+                    const branch = await this._getCurrentBranch();
                     if (branch) {
                         this._logOperation('resolveRef', { ref, options }, { success: true, abbrev: branch });
                         return branch;
@@ -1670,7 +1679,7 @@ export class MemoryGit {
                 return oid;
             }
 
-            const branch = await git.currentBranch({ fs: this.fs, dir: this.dir });
+            const branch = await this._getCurrentBranch();
 
             if (branch) {
                 await git.writeRef({
@@ -1790,6 +1799,58 @@ export class MemoryGit {
     /** Drop the cached tag→commit map. Call after any write touching tags. */
     private _invalidateTagCache(): void {
         this._tagOidsCache.invalidate();
+    }
+
+    /**
+     * Lazily loaded current-branch name (the symbolic target of HEAD, or
+     * `undefined` when detached) with concurrent-load deduplication. HEAD's
+     * branch changes only on a small set of ops (checkout, init, clone, clear,
+     * renameBranch), so caching it across the instance lifetime spares every
+     * read-side caller — `status`, `diff`, `log`, `reset`, `listBranches`,
+     * `getRepoInfo`, the `exec` dispatch — a `.git/HEAD` read on lazy/EFS.
+     *
+     * Note: a detached HEAD resolves to `undefined`, which MemoizedAsync
+     * treats as "not cached", so detached reads simply aren't memoized
+     * (correct, just unoptimized — the common case is being on a branch).
+     */
+    private _currentBranchCache = new MemoizedAsync<string | undefined>();
+
+    /**
+     * Lazily loaded raw local branch-name list (`git.listBranches`) with
+     * concurrent-load deduplication. The name set changes only when branches
+     * are created/deleted/renamed (plus init/clone/clear), not when refs move,
+     * so it survives commits/merges/resets untouched.
+     */
+    private _branchListCache = new MemoizedAsync<string[]>();
+
+    /**
+     * Drop the cached current-branch and branch-name list. Call after any
+     * write that can change which branches exist or where HEAD points
+     * (createBranch, deleteBranch, renameBranch, checkout, init, clone, clear,
+     * loadFromDisk).
+     */
+    private _invalidateBranchCaches(): void {
+        this._currentBranchCache.invalidate();
+        this._branchListCache.invalidate();
+    }
+
+    /**
+     * Cached resolver for the current branch. Shared by the public
+     * `currentBranch()` and every internal read site so a burst of concurrent
+     * callers triggers a single `git.currentBranch` read.
+     */
+    private _getCurrentBranch(): Promise<string | undefined> {
+        return this._currentBranchCache.get(async () => {
+            const branch = await git.currentBranch({ fs: this.fs, dir: this.dir });
+            return branch || undefined;
+        });
+    }
+
+    /** Cached resolver for the raw local branch-name list. */
+    private _getBranchNames(): Promise<string[]> {
+        return this._branchListCache.get(() =>
+            git.listBranches({ fs: this.fs, dir: this.dir }),
+        );
     }
 
     /**
@@ -2944,6 +3005,9 @@ export class MemoryGit {
             this.isInitialized = true;
             // After clone, workdir and index are in sync — nothing pending
             this._dirtyFiles.clear();
+            // Fresh refs/HEAD from the remote — drop the tag + branch caches.
+            this._invalidateTagCache();
+            this._invalidateBranchCaches();
             this._logOperation('clone', { url, options }, { success: true });
             return true;
         } catch (error) {
@@ -3132,6 +3196,9 @@ export class MemoryGit {
             this._diskSnapshot.clear();
             this._snapshotPath = null;
             this._snapshotSkippedAtLoad = false;
+            // Volume wiped — every ref-derived cache is now stale.
+            this._invalidateTagCache();
+            this._invalidateBranchCaches();
             this._logOperation('clear', {}, { success: true });
             return true;
         } catch (error) {
@@ -3182,7 +3249,7 @@ export class MemoryGit {
         const lines: string[] = [];
 
         if (options.branch) {
-            const current = await git.currentBranch({ fs: this.fs, dir: this.dir });
+            const current = await this._getCurrentBranch();
             lines.push(`## ${current ?? 'HEAD (no branch)'}`);
         }
 

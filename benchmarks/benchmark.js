@@ -977,6 +977,79 @@ async function benchmarkProcessOverhead() {
 }
 
 /**
+ * Ref-cache coalescing (currentBranch / listBranches).
+ *
+ * On lazy mode / slow filesystems every `git.currentBranch` and
+ * `git.listBranches` is a disk round-trip for `.git/HEAD`, the branch
+ * ref, and `.git/packed-refs`. These resolve through MemoizedAsync caches
+ * that (a) collapse a concurrent burst into one underlying read and
+ * (b) serve the whole instance lifetime until a branch/HEAD write.
+ *
+ * We instrument the underlying isomorphic-git calls to count the disk-eligible
+ * reads actually issued vs the number of logical reads the caller made.
+ */
+async function benchmarkRefCacheCoalescing() {
+    console.log('\n' + '='.repeat(70));
+    console.log('BENCHMARK: ref-cache coalescing (currentBranch / listBranches)');
+    console.log('='.repeat(70));
+
+    // Wrap the same isomorphic-git object the library calls.
+    const gitMod = require('isomorphic-git');
+    const git = gitMod.default || gitMod;
+    let cbReads = 0, lbReads = 0;
+    const origCb = git.currentBranch, origLb = git.listBranches;
+    git.currentBranch = function (...a) { cbReads++; return origCb.apply(this, a); };
+    git.listBranches = function (...a) { lbReads++; return origLb.apply(this, a); };
+
+    try {
+        const mg = new MemoryGit('refcache-bench');
+        mg.setAuthor('Bench', 'b@b.com');
+        await mg.init();
+        await mg.writeFile('a.txt', '1');
+        await mg.add('.');
+        await mg.commit('c1');
+        await mg.createBranch('feature'); // leave caches cold
+
+        // 1) A single concurrent read burst (the Promise.all a route handler fires)
+        cbReads = 0; lbReads = 0;
+        const burst = 8;
+        const calls = [];
+        for (let i = 0; i < burst; i++) { calls.push(mg.currentBranch(), mg.listBranches()); }
+        await Promise.all(calls);
+        const logicalBurst = burst * 2;
+        console.log(`\n🔀 Concurrent burst: ${logicalBurst} logical reads (${burst}× currentBranch + ${burst}× listBranches)`);
+        console.log(`   Underlying disk-eligible reads: currentBranch=${cbReads}, listBranches=${lbReads}`);
+        console.log(`   → ${logicalBurst} calls collapsed to ${cbReads + lbReads} reads (${(logicalBurst / Math.max(cbReads + lbReads, 1)).toFixed(0)}x fewer round-trips)`);
+
+        // 2) A warm session: many reads across the instance lifetime, no branch writes
+        cbReads = 0; lbReads = 0;
+        const session = 500;
+        for (let i = 0; i < session; i++) {
+            await mg.currentBranch();
+            await mg.listBranches();
+            await mg.status();           // also resolves HEAD internally
+        }
+        console.log(`\n♻️  Warm session: ${session}× (currentBranch + listBranches + status)`);
+        console.log(`   Underlying reads over the whole session: currentBranch=${cbReads}, listBranches=${lbReads}`);
+        console.log(`   → without the cache this is ~${session * 2}+ reads; cached serves them from memory`);
+
+        // 3) Invalidation cost: each branch write forces exactly one re-read on next access
+        cbReads = 0; lbReads = 0;
+        const writes = 20;
+        for (let i = 0; i < writes; i++) {
+            await mg.createBranch(`b${i}`);
+            await mg.currentBranch();     // cold after invalidation → 1 read
+            await mg.listBranches();      // cold after invalidation → 1 read
+        }
+        console.log(`\n🔁 Interleaved writes: ${writes}× (createBranch + currentBranch + listBranches)`);
+        console.log(`   Underlying reads: currentBranch=${cbReads}, listBranches=${lbReads} (1 re-read per write, as expected)`);
+    } finally {
+        git.currentBranch = origCb;
+        git.listBranches = origLb;
+    }
+}
+
+/**
  * Runs all benchmarks
  */
 async function main() {
@@ -1033,7 +1106,10 @@ async function main() {
 
     // Lazy mode vs eager
     await benchmarkLazyVsEager();
-    
+
+    // Ref-cache coalescing (currentBranch / listBranches)
+    await benchmarkRefCacheCoalescing();
+
     console.log('\n' + '='.repeat(70));
     console.log('CONCLUSION');
     console.log('='.repeat(70));

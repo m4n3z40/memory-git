@@ -192,9 +192,9 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `deleteBranch(name, options?)` | `{force}` — without force, refuses to delete unmerged branches |
 | `renameBranch(old, new)` | `git branch -m` |
 | `checkout(ref, options?)` | `{createBranch, force, files}` |
-| `listBranches()` | Returns `BranchInfo[]` |
+| `listBranches()` | Returns `BranchInfo[]`. Cached per instance with in-flight dedup (see [Concurrency](#concurrency-and-caching)); invalidated on any branch create/delete/rename/checkout |
 | `branchText()` | `git branch` text format (current branch prefixed with `*`) |
-| `currentBranch()` | Returns current branch name |
+| `currentBranch()` | Returns current branch name. Cached per instance with in-flight dedup; invalidated when HEAD moves to another branch |
 | `merge(branch, options?)` | `{noFastForward, fastForwardOnly, message, strategy, allowUnrelatedHistories}`. `strategy: 'ours'\|'theirs'` resolves every conflict by keeping that side wholesale (mirrors `git merge -X ours\|theirs`) |
 | `abortMerge()` | `git merge --abort`. Restores the working tree to its pre-merge state and clears `MERGE_HEAD`/`MERGE_MSG`/`MERGE_MODE`. Throws if no merge is in progress |
 
@@ -510,6 +510,31 @@ Reachability is computed from local branches, remote-tracking branches, tags, an
 - No custom delta compression — the resulting pack may be larger than what `git gc` produces natively. Re-running `git gc` on disk after a flush re-packs with deltas if size matters.
 - Submodule pointers are not followed (their history lives in another repo).
 
+## Concurrency and caching
+
+A MemoryGit instance is typically shared by everything working on one repo — a route handler firing `Promise.all([mg.status(), mg.diff(), mg.currentBranch(), mg.listBranches()])`, a worker servicing concurrent requests, an agent fanning out reads. Several read paths resolve the same underlying state (HEAD, the branch list, the tag→commit map), and on lazy mode / slow filesystems each resolution is a disk round-trip. To keep that cheap, those resolvers are memoized per instance with **in-flight deduplication**: concurrent callers share one load instead of each starting their own, and the result is reused for the instance lifetime until a write invalidates it.
+
+| Cached resolver | Backs | Invalidated by |
+|---|---|---|
+| current branch (`HEAD`) | `currentBranch()`, `resolveRef('HEAD', {abbrevRef})`, `reset`, `statusText --branch`, `listBranches` | `checkout`, `createBranch`/`deleteBranch`/`renameBranch`, `init`, `clone`, `clear`, `loadFromDisk` |
+| local branch name list | `listBranches()` | same as above |
+| tag → commit OID map | `describeExact`, `tagsPointingAt`, `showTagRefs` | `createTag`/`deleteTag`, `init`, `clone`, `clear`, `loadFromDisk` |
+
+Ref *moves* that don't change names or where HEAD points — `commit`, `reset`, `merge` — deliberately don't invalidate the branch caches: the branch you're on and the set of branch names are unchanged, only the commit a ref points at moves.
+
+This is transparent — there's no API to opt in or out, and correctness is preserved because every mutating method drops the affected caches. The only caveat: if you bypass the public API and mutate refs directly through `mg.fs` / `mg.volume`, call the relevant operation through MemoryGit instead so the caches stay coherent.
+
+```typescript
+// One Promise.all burst → one .git/HEAD read + one branch-list read,
+// not one per call. Subsequent reads are served from memory until a
+// branch/HEAD write.
+const [status, branch, branches] = await Promise.all([
+  mg.status(),
+  mg.currentBranch(),
+  mg.listBranches(),
+]);
+```
+
 ## Memory footprint on Node 26+
 
 Node v26 introduced a regression where `new Blob([buffer]).stream()` pins its
@@ -585,13 +610,15 @@ Run `pnpm run benchmark` to reproduce.
 | Init + 50 files + commit + branch + merge | 965ms | 104ms | **9.2× faster** |
 | End-to-end `gc` on 500-commit repo (1500 loose objects): native `git gc` in place vs `loadFromDisk + mg.gc() + flush({clean:true})` | 393ms | 1159ms (116 load + 793 gc + 250 flush) | Native wins ~3× on local SSD. Ratio inverts on EFS/NFS — see below |
 | `loadFromDisk` on 500-file repo (~1MB workdir + `.git/`) | eager: 45.5ms / ~1.77 MB in RAM | lazy: 11.0ms / near-zero in RAM (dir skeleton only) | **~4× faster load** + memory scales with what you actually read, not repo size. First read of any path pays its disk cost — see [Lazy mode](#lazy-mode) |
+| Concurrent ref reads — one `Promise.all` of 8× `currentBranch` + 8× `listBranches` | — | 16 logical reads → **2** disk-eligible reads | **8× fewer round-trips**; a 500-read warm session collapses to **0** reads — see [Concurrency](#concurrency-and-caching) |
 
-Four takeaways:
+Five takeaways:
 
 1. **`exec()` parsing is free.** It adds 3-6µs to a call that previously cost ~12ms via subprocess. The string-API ergonomics carry no real cost.
 2. **The agent-loop pattern is the killer use case.** Many small read-style calls amortize JS-level overhead and skip the per-call spawn tax — **>100× faster end-to-end**.
 3. **Multi-file commits are also faster.** A dirty-set tracker (writeFile marks files as needing re-stage; `add('.')` only touches those) means write-heavy workloads beat the C binary on local SSD too.
 4. **Lazy mode decouples startup cost from repo size.** When you only need a slice of the repo (HEAD + one path, one `git log`), `{ lazy: true }` skips the full-tree read and faults files in on first access.
+5. **Concurrent ref reads coalesce.** `currentBranch()` / `listBranches()` (and the tag lookups behind `describeExact` / `tagsPointingAt`) share per-instance caches with in-flight dedup, so a route handler's `Promise.all([...])` burst issues one `.git/HEAD` + one ref read instead of N, and stays cached until the next branch/HEAD write.
 
 **The gap widens dramatically on slow filesystems.** Git's `.git/objects/` is small-file-heavy by design (one file per blob, tree, and commit), which is the worst-case access pattern for EFS, NFS, and overlay/networked dev-container volumes. A `git log` over a large history that runs in 50ms on local SSD can take tens of seconds on EFS — every object is a round-trip. MemoryGit keeps all that in RAM and only flushes the actual working-tree files back when you ask it to.
 
@@ -602,7 +629,7 @@ Four takeaways:
 - macOS 26.3.1
 - APFS on internal NVMe SSD
 - Node.js v26.1.0
-- memory-git v3.1.1, isomorphic-git v1.37, memfs v4.57
+- memory-git v3.10, isomorphic-git v1.38.2, memfs v4.57
 
 Numbers vary per machine; the ratios are what matter, and they grow on slower disks.
 
