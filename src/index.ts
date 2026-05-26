@@ -7,6 +7,7 @@ import { parse as shellParse } from 'shell-quote';
 import ignore from 'ignore';
 
 import { MemoizedAsync } from './memoized-async.js';
+import { InFlightAsync } from './in-flight-async.js';
 import { OperationLog } from './operation-log.js';
 import {
     realPathExists,
@@ -282,6 +283,11 @@ export class MemoryGit {
             'realDir', 'isInitialized', 'author',
             '_log', '_stash', '_dirtyFiles', '_diskSnapshot', '_snapshotPath',
             '_tracksDiskSnapshot', '_snapshotSkippedAtLoad',
+            // Per-instance read caches: the view shares the parent's volume and
+            // state, so it must share the cache instances too — otherwise a
+            // parent-side write that invalidates a cache wouldn't be seen here.
+            '_tagOidsCache', '_currentBranchCache', '_branchListCache',
+            '_statusMatrixInFlight',
         ] as const;
         for (const key of sharedFields) {
             Object.defineProperty(view, key, {
@@ -911,7 +917,7 @@ export class MemoryGit {
                     parentExists = false;
                 }
                 if (parentExists) {
-                    const matrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
+                    const matrix = await this._statusMatrix();
                     const hasStaged = matrix.some(([, head, , stage]) => head !== stage);
                     if (!hasStaged) {
                         throw new Error('nothing to commit, working tree clean');
@@ -941,8 +947,8 @@ export class MemoryGit {
      */
     async status(): Promise<FileStatus[]> {
         try {
-            const statusMatrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
-            
+            const statusMatrix = await this._statusMatrix();
+
             const result = statusMatrix.map(([filepath, head, workdir, stage]) => ({
                 filepath: filepath as string,
                 head: head as number,
@@ -1706,7 +1712,7 @@ export class MemoryGit {
                     }
                 }
                 // Also reset any staged files not in the target commit
-                const statusMatrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
+                const statusMatrix = await this._statusMatrix();
                 for (const [filepath, head, , stage] of statusMatrix) {
                     if (stage !== head) {
                         try {
@@ -1850,6 +1856,24 @@ export class MemoryGit {
     private _getBranchNames(): Promise<string[]> {
         return this._branchListCache.get(() =>
             git.listBranches({ fs: this.fs, dir: this.dir }),
+        );
+    }
+
+    /**
+     * In-flight dedup for the full status matrix — the single most expensive
+     * read (a whole-tree walk + blob hashing). `status`, `diff`, the empty-
+     * commit guard, `reset --mixed`, and `statusText` all build the same
+     * matrix, and an agent route firing them together (`Promise.all`) would
+     * otherwise walk the tree once per call. Unlike the branch/tag caches the
+     * result is NEVER retained across settlement — the working tree changes on
+     * every write — so only genuinely concurrent callers share the build.
+     */
+    private _statusMatrixInFlight = new InFlightAsync<Awaited<ReturnType<typeof git.statusMatrix>>>();
+
+    /** Coalesced `git.statusMatrix` (full workdir, no path filter). */
+    private _statusMatrix(): Promise<Awaited<ReturnType<typeof git.statusMatrix>>> {
+        return this._statusMatrixInFlight.run(() =>
+            git.statusMatrix({ fs: this.fs, dir: this.dir }),
         );
     }
 
@@ -2745,7 +2769,7 @@ export class MemoryGit {
                 const changed = await this.getChangedFiles(options.fromRef, toRef);
                 changes = changed.map(c => ({ filepath: c.filepath, status: c.status }));
             } else {
-                const matrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
+                const matrix = await this._statusMatrix();
                 // statusMatrix uses an mtime-second + size shortcut that can
                 // miss same-size edits in fast in-memory flows. Re-hash any
                 // file we know was touched via memory-git's writeFile/delete
@@ -3245,7 +3269,7 @@ export class MemoryGit {
      * Each line is `XY filename` where X = staged, Y = working tree.
      */
     async statusText(options: { porcelain?: boolean; short?: boolean; branch?: boolean } = {}): Promise<string> {
-        const matrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
+        const matrix = await this._statusMatrix();
         const lines: string[] = [];
 
         if (options.branch) {

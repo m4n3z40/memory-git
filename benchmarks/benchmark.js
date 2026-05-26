@@ -996,10 +996,11 @@ async function benchmarkRefCacheCoalescing() {
     // Wrap the same isomorphic-git object the library calls.
     const gitMod = require('isomorphic-git');
     const git = gitMod.default || gitMod;
-    let cbReads = 0, lbReads = 0;
-    const origCb = git.currentBranch, origLb = git.listBranches;
+    let cbReads = 0, lbReads = 0, smReads = 0;
+    const origCb = git.currentBranch, origLb = git.listBranches, origSm = git.statusMatrix;
     git.currentBranch = function (...a) { cbReads++; return origCb.apply(this, a); };
     git.listBranches = function (...a) { lbReads++; return origLb.apply(this, a); };
+    git.statusMatrix = function (...a) { smReads++; return origSm.apply(this, a); };
 
     try {
         const mg = new MemoryGit('refcache-bench');
@@ -1043,9 +1044,16 @@ async function benchmarkRefCacheCoalescing() {
         }
         console.log(`\n🔁 Interleaved writes: ${writes}× (createBranch + currentBranch + listBranches)`);
         console.log(`   Underlying reads: currentBranch=${cbReads}, listBranches=${lbReads} (1 re-read per write, as expected)`);
+
+        // 4) statusMatrix in-flight dedup — status/diff/statusText fired together
+        for (let i = 0; i < 40; i++) await mg.writeFile(`w_${i}.txt`, 'x'); // dirty workdir
+        smReads = 0;
+        await Promise.all([mg.status(), mg.diff(), mg.statusText(), mg.status()]);
+        console.log(`\n🔬 Concurrent status/diff/statusText/status: underlying statusMatrix = ${smReads} (one whole-tree walk shared, not 4)`);
     } finally {
         git.currentBranch = origCb;
         git.listBranches = origLb;
+        git.statusMatrix = origSm;
     }
 }
 

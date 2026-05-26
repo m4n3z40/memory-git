@@ -522,7 +522,9 @@ A MemoryGit instance is typically shared by everything working on one repo — a
 
 Ref *moves* that don't change names or where HEAD points — `commit`, `reset`, `merge` — deliberately don't invalidate the branch caches: the branch you're on and the set of branch names are unchanged, only the commit a ref points at moves.
 
-This is transparent — there's no API to opt in or out, and correctness is preserved because every mutating method drops the affected caches. The only caveat: if you bypass the public API and mutate refs directly through `mg.fs` / `mg.volume`, call the relevant operation through MemoryGit instead so the caches stay coherent.
+The **status matrix** — the whole-tree walk + blob hashing behind `status()`, `diff()`, `statusText()`, the empty-commit guard, and `reset --mixed` — uses a different policy. Its result tracks the working tree, which changes on every write, so it is never retained: only callers that overlap *in flight* (the same `Promise.all` burst) share one walk; the next call after settlement always rebuilds. So a concurrent `[status, diff, statusText]` does one tree walk instead of three, while a read issued after an awaited write still sees fresh state.
+
+This is transparent — there's no API to opt in or out, and correctness is preserved because every mutating method drops the affected caches (and the status matrix is never cached past the in-flight window). The only caveat: if you bypass the public API and mutate refs directly through `mg.fs` / `mg.volume`, call the relevant operation through MemoryGit instead so the caches stay coherent.
 
 ```typescript
 // One Promise.all burst → one .git/HEAD read + one branch-list read,
