@@ -474,6 +474,12 @@ export async function indexDiskLazy(
  * Recursively list files under an in-memory directory. By default skips
  * `.git/` so callers don't have to filter; pass `includeGit: true` for the
  * full set.
+ *
+ * Uses `lstatSync` (not `statSync`) so symlinks are treated as leaves rather
+ * than followed: a dangling symlink (e.g. a `node_modules` pointing at a
+ * deleted cache) would otherwise make `statSync` throw `ENOENT` and abort the
+ * whole walk. Per-entry `ENOENT` is also swallowed to tolerate entries that
+ * vanish mid-walk.
  */
 export function listFilesRecursive(
     fs: MemFs,
@@ -487,8 +493,17 @@ export function listFilesRecursive(
     for (const entry of entries) {
         const fullPath = pathNode.posix.join(dir, entry);
         const relativePath = base ? pathNode.posix.join(base, entry) : entry;
-        const stat = fs.statSync(fullPath);
 
+        let stat;
+        try {
+            stat = fs.lstatSync(fullPath);
+        } catch (err) {
+            // Entry disappeared between readdir and lstat — skip it.
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+            throw err;
+        }
+
+        // Symlinks are leaves: never descend (dangling links don't resolve).
         if (stat.isDirectory()) {
             if (entry === '.git' && !includeGit) continue;
             files.push(...listFilesRecursive(fs, fullPath, relativePath, includeGit));

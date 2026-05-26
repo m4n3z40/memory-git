@@ -25,6 +25,7 @@ import ignore from 'ignore';
 import {
     copyDiskToMemoryIncremental,
     copyMemoryToDiskIncremental,
+    listFilesRecursive,
     type FileFingerprint,
 } from '../src/disk-sync';
 import { MemoryGit } from '../src/index';
@@ -311,4 +312,70 @@ describe('disk-sync race integration (native git)', () => {
         const out = (fsck.stdout || '') + (fsck.stderr || '');
         expect(out).not.toMatch(/unknown object type|pack checksum mismatch|cannot unpack/);
     }, 60_000);
+});
+
+/**
+ * Regression coverage for the dangling-symlink crash (memory-git@3.10.4):
+ * listFilesRecursive used statSync, which *follows* symlinks. A dead symlink
+ * (e.g. a `node_modules` pointing at a deleted cache) made statSync throw
+ * ENOENT and abort the entire walk. lstatSync treats symlinks as leaves and
+ * never resolves their target, so the listing stays intact.
+ */
+describe('listFilesRecursive symlink resilience (unit)', () => {
+    it('does not throw on a dangling symlink and lists it as a leaf', () => {
+        const vol = new Volume();
+        const fs = createFsFromVolume(vol);
+        fs.mkdirSync('/repo', { recursive: true });
+        fs.writeFileSync('/repo/README.md', '# test');
+        // Dead symlink: target does not exist. statSync would throw ENOENT here.
+        fs.symlinkSync('/does/not/exist', '/repo/node_modules');
+
+        let files: string[] = [];
+        expect(() => {
+            files = listFilesRecursive(fs as any, '/repo');
+        }).not.toThrow();
+
+        expect(files).toContain('README.md');
+        // The dead symlink is surfaced as a leaf, not followed/descended.
+        expect(files).toContain('node_modules');
+    });
+
+    it('treats a symlink to a directory as a leaf rather than descending', () => {
+        const vol = new Volume();
+        const fs = createFsFromVolume(vol);
+        fs.mkdirSync('/repo/real', { recursive: true });
+        fs.writeFileSync('/repo/real/inner.js', 'code');
+        // Live symlink pointing at a real directory.
+        fs.symlinkSync('/repo/real', '/repo/link');
+
+        const files = listFilesRecursive(fs as any, '/repo');
+
+        expect(files).toContain('real/inner.js');
+        // We must not follow the symlink into the target directory.
+        expect(files).toContain('link');
+        expect(files).not.toContain('link/inner.js');
+    });
+
+    it('skips an entry that vanishes between readdir and lstat', () => {
+        const vol = new Volume();
+        const fs = createFsFromVolume(vol);
+        fs.mkdirSync('/repo', { recursive: true });
+        fs.writeFileSync('/repo/keep.txt', 'keep');
+        fs.writeFileSync('/repo/gone.txt', 'gone');
+
+        const realLstat = fs.lstatSync.bind(fs);
+        const spy = vi.spyOn(fs, 'lstatSync').mockImplementation(((p: any, opts?: any) => {
+            if (typeof p === 'string' && p.endsWith('/gone.txt')) throw enoent(p);
+            return realLstat(p, opts);
+        }) as typeof fs.lstatSync);
+
+        let files: string[] = [];
+        expect(() => {
+            files = listFilesRecursive(fs as any, '/repo');
+        }).not.toThrow();
+
+        expect(files).toContain('keep.txt');
+        expect(files).not.toContain('gone.txt');
+        spy.mockRestore();
+    });
 });
