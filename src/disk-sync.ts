@@ -12,7 +12,7 @@
 
 import { promises as fsRealAsync } from 'fs';
 import type { Dirent } from 'fs';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import pathNode from 'path';
 import type { createFsFromVolume } from 'memfs';
 import type ignore from 'ignore';
@@ -35,6 +35,73 @@ export interface FileFingerprint {
 /** SHA-1 of a buffer, hex-encoded. Same algorithm git uses internally. */
 export function hashBuffer(buf: Buffer): string {
     return createHash('sha1').update(buf).digest('hex');
+}
+
+/** Infix marking a sibling temp file written by `atomicWriteFile`. */
+const TEMP_INFIX = '.mg-flush-tmp-';
+
+/** True for an atomic-flush temp left behind by a flush killed mid-write. */
+export function isFlushTempName(name: string): boolean {
+    return name.includes(TEMP_INFIX);
+}
+
+/**
+ * Write `content` to `realPath` atomically: write a sibling temp then
+ * rename(2) over the target. A kill (SIGKILL/SIGABRT) mid-flush never leaves
+ * the target truncated — rename(2) is atomic within a filesystem, so the
+ * target is always either the intact old bytes or the intact new bytes.
+ *
+ * Plain writeFile truncates the target to 0 before writing; a crash in that
+ * window left .git/HEAD, .git/index, loose objects, packfiles and refs
+ * zeroed/partial — the prod corruption this guards against (SKP-737).
+ *
+ * Process-kill safety, NOT power-loss: no per-file fsync on purpose. A flush
+ * writes hundreds of files and fsync latency on network FS (EFS) would
+ * dominate; a process kill preserves the page cache, so rename ordering is
+ * enough. (For power-loss durability, fsync only HEAD/index/refs.)
+ *
+ * Bonus: renaming onto a 0444 loose object needs write on the *dir*, not the
+ * file, so this also sidesteps the EACCES-on-rewrite of immutable objects.
+ *
+ * On any error the temp is removed best-effort and the original error rethrown.
+ */
+export async function atomicWriteFile(realPath: string, content: Buffer): Promise<void> {
+    const dir = pathNode.dirname(realPath);
+    const tmp = pathNode.join(
+        dir,
+        `${pathNode.basename(realPath)}${TEMP_INFIX}${process.pid}-${randomBytes(8).toString('hex')}`,
+    );
+    let handle: Awaited<ReturnType<typeof fsRealAsync.open>> | undefined;
+    try {
+        handle = await fsRealAsync.open(tmp, 'w');
+        await handle.writeFile(content);
+        await handle.close();
+        handle = undefined;
+        await fsRealAsync.rename(tmp, realPath);
+    } catch (err) {
+        if (handle) { try { await handle.close(); } catch { /* noop */ } }
+        try { await fsRealAsync.unlink(tmp); } catch { /* noop */ }
+        throw err;
+    }
+}
+
+/**
+ * Best-effort reap of an orphan flush temp found during a disk→memory walk.
+ * A temp present at load time was stranded by a flush killed before its
+ * rename(2) — under the single-writer-per-repo model that means the prior
+ * crashed process. Removing it here keeps the working tree free of
+ * `*.mg-flush-tmp-*` litter (sibling temps would otherwise accumulate across
+ * crashes, since nothing in the flush path ever rewrites or cleans them).
+ *
+ * Best-effort by design: a vanished file, or a temp owned by a concurrent
+ * live writer, must not abort the load — swallow and move on.
+ */
+async function reapFlushTemp(realPath: string): Promise<void> {
+    try {
+        await fsRealAsync.unlink(realPath);
+    } catch {
+        /* already gone, or a concurrent writer owns it — leave it */
+    }
 }
 
 /**
@@ -179,6 +246,14 @@ export async function copyDiskToMemory(
     const entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
 
     const promises = entries.map(async (entry) => {
+        // An orphan temp from a flush killed before its rename(2). Never a
+        // tracked file — reap it (keeps the tree clean) and skip so it can't
+        // pollute memfs / a subsequent commit.
+        if (isFlushTempName(entry.name)) {
+            await reapFlushTemp(pathNode.join(realPath, entry.name));
+            return 0;
+        }
+
         const entryRel = relPath ? pathNode.posix.join(relPath, entry.name) : entry.name;
 
         // Always load the repo's own .git/ regardless of ignore patterns.
@@ -253,8 +328,8 @@ export async function copyMemoryToDisk(
             if (isImmutableObjectPath(entryRel) && await realPathExists(realEntryPath)) {
                 return 0;
             }
-            const content = fs.readFileSync(memoryEntryPath);
-            await fsRealAsync.writeFile(realEntryPath, content);
+            const content = fs.readFileSync(memoryEntryPath) as Buffer;
+            await atomicWriteFile(realEntryPath, content);
             return 1;
         }
     });
@@ -296,6 +371,12 @@ export async function copyDiskToMemoryIncremental(
     }
 
     const results = await Promise.all(entries.map(async (entry) => {
+        // Orphan flush temp (rename never happened) — reap + skip; see copyDiskToMemory.
+        if (isFlushTempName(entry.name)) {
+            await reapFlushTemp(pathNode.join(realPath, entry.name));
+            return { read: 0, skipped: 0 };
+        }
+
         const entryRel = relPath ? pathNode.posix.join(relPath, entry.name) : entry.name;
 
         const insideGit = entryRel === '.git' || entryRel.startsWith('.git/');
@@ -461,14 +542,14 @@ export async function copyMemoryToDiskIncremental(
             if (prior.hash === hash) {
                 return { written: 0, skipped: 1 };
             }
-            await fsRealAsync.writeFile(realEntryPath, content);
+            await atomicWriteFile(realEntryPath, content);
             const newStat = await fsRealAsync.stat(realEntryPath);
             snapshot.set(entryRel, { size, mtimeMs: newStat.mtimeMs, hash });
             return { written: 1, skipped: 0 };
         }
 
         const hash = hashBuffer(content);
-        await fsRealAsync.writeFile(realEntryPath, content);
+        await atomicWriteFile(realEntryPath, content);
         const newStat = await fsRealAsync.stat(realEntryPath);
         snapshot.set(entryRel, { size, mtimeMs: newStat.mtimeMs, hash });
         return { written: 1, skipped: 0 };
@@ -503,6 +584,12 @@ export async function indexDiskLazy(
     const entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
 
     const promises = entries.map(async (entry) => {
+        // Orphan flush temp (rename never happened) — reap + skip; see copyDiskToMemory.
+        if (isFlushTempName(entry.name)) {
+            await reapFlushTemp(pathNode.join(realPath, entry.name));
+            return 0;
+        }
+
         const entryRel = relPath ? pathNode.posix.join(relPath, entry.name) : entry.name;
 
         const insideGit = entryRel === '.git' || entryRel.startsWith('.git/');
