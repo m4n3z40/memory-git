@@ -144,6 +144,8 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `clone(url, options?)` | Clones remote. `{branch, depth, singleBranch, noCheckout}` |
 | `clear()` | Resets memory state |
 | `flush(targetPath?, options?)` | Syncs memory to disk. `{clean, force}` — incremental by default; `force:true` does a full rewrite |
+| `isDirty()` | `true` if there is in-memory state not yet persisted to disk — working-tree writes **or** internal `.git/` writes (commits, tags, refs, index) from any operation. O(1). Use it to decide *when* to `flush()` under the write-behind model: it flips `true` the instant a commit or tag is created (even with no working-tree change) and back to `false` after `flush()`. Does **not** auto-flush |
+| `getDirtyPaths()` | The repo-relative paths behind `isDirty()` (e.g. `src/app.tsx`, `.git/refs/tags/v0.0.1`). Snapshot copy, for logging/observability |
 
 ### Files
 

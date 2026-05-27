@@ -22,6 +22,7 @@ import {
     type FileFingerprint,
 } from './disk-sync.js';
 import { LazyState, wrapLazyFs } from './lazy-fs.js';
+import { wrapRecordingFs } from './recording-fs.js';
 import { getCommand, type Command } from './commands/index.js';
 import { primeSafeCompression } from './compression-fix.js';
 
@@ -168,6 +169,15 @@ export class MemoryGit {
      */
     private _dirtyFiles: Set<string> = new Set();
     /**
+     * Repo-relative paths mutated in memory but not yet flushed to disk —
+     * working-tree writes AND internal `.git/` writes (objects, refs, index,
+     * HEAD) from any mutating op. Recorded at the fs layer (see
+     * recording-fs.ts), surfaced by `isDirty()`/`getDirtyPaths()`, and cleared
+     * by `flush()` (for persisted paths) and `loadFromDisk()`/`clear()`. Lets
+     * the consumer decide *when* to flush under the write-behind model.
+     */
+    private _unpersisted: Set<string> = new Set();
+    /**
      * Fingerprint of every file we know to be on disk, keyed by repo-relative
      * path. Populated by `loadFromDisk` (unless `skipSnapshot:true`) and
      * updated by `flush`. Lets us skip reads/writes of files whose disk state
@@ -233,9 +243,10 @@ export class MemoryGit {
         if (options.tracksDiskSnapshot === false) {
             this._tracksDiskSnapshot = false;
         }
+        let baseFs: MemFs;
         if (options.lazy === true) {
             this._lazy = true;
-            this.fs = wrapLazyFs(rawFs, this._lazyState, (memPath, size, mtimeMs, hash) => {
+            baseFs = wrapLazyFs(rawFs, this._lazyState, (memPath, size, mtimeMs, hash) => {
                 // Translate the in-memory path back to the snapshot key
                 // (repo-relative). The snapshot is keyed off `this.dir`,
                 // not the wrapper's view of it, so we strip the prefix.
@@ -245,8 +256,14 @@ export class MemoryGit {
                 this._diskSnapshot.set(rel, { size, mtimeMs, hash });
             });
         } else {
-            this.fs = rawFs;
+            baseFs = rawFs;
         }
+        // Outermost layer: record every mutation so isDirty()/getDirtyPaths()
+        // reflect *all* unpersisted state, including `.git/`-only writes from
+        // commit/tag/merge. Lazy materialization writes the inner volume
+        // directly, bypassing this wrapper, so faulting a file in from disk is
+        // correctly not counted as a mutation.
+        this.fs = wrapRecordingFs(baseFs, (memPath) => this._recordUnpersisted(memPath));
     }
 
     /**
@@ -285,7 +302,7 @@ export class MemoryGit {
         const sharedFields = [
             'name', 'fs', 'vol', 'dir',
             'realDir', 'isInitialized', 'author',
-            '_log', '_stash', '_dirtyFiles', '_diskSnapshot', '_snapshotPath',
+            '_log', '_stash', '_dirtyFiles', '_unpersisted', '_diskSnapshot', '_snapshotPath',
             '_tracksDiskSnapshot', '_snapshotSkippedAtLoad',
             // Per-instance read caches: the view shares the parent's volume and
             // state, so it must share the cache instances too — otherwise a
@@ -683,6 +700,11 @@ export class MemoryGit {
                 this._dirtyFiles.add(f);
             }
 
+            // Just hydrated from disk: memory mirrors disk, nothing is pending.
+            // (Eager copy writes through this.fs, which would otherwise look
+            // dirty.) Lazy materialization bypasses the recorder, so this is a
+            // belt-and-suspenders clear for the eager path.
+            this._unpersisted.clear();
             this.isInitialized = true;
             return fileCount;
         } catch (error) {
@@ -2526,6 +2548,10 @@ export class MemoryGit {
      */
     async flush(targetPath: string | null = null, options: FlushOptions = {}): Promise<number> {
         try {
+            // Snapshot the dirty paths up front and clear exactly these on
+            // success, so any write that lands *during* the async flush stays
+            // marked dirty (it may not have been on disk when we walked).
+            const persistedThisFlush = [...this._unpersisted];
             const destination = targetPath ? pathNode.resolve(targetPath) : this.realDir;
             if (!destination) {
                 throw new Error('No destination path specified and repository was not loaded from disk');
@@ -2581,6 +2607,7 @@ export class MemoryGit {
                     fullRewrite: true,
                     fallbackToFull,
                 });
+                for (const p of persistedThisFlush) this._unpersisted.delete(p);
                 return fileCount;
             }
 
@@ -2644,6 +2671,7 @@ export class MemoryGit {
                 skipped,
                 removed,
             });
+            for (const p of persistedThisFlush) this._unpersisted.delete(p);
             return written;
         } catch (error) {
             this._logOperation('flush', { targetPath }, null, error as Error);
@@ -3396,6 +3424,7 @@ export class MemoryGit {
             this.isInitialized = false;
             this._stash = [];
             this._dirtyFiles.clear();
+            this._unpersisted.clear();
             this._diskSnapshot.clear();
             this._snapshotPath = null;
             this._snapshotSkippedAtLoad = false;
@@ -3408,6 +3437,44 @@ export class MemoryGit {
             this._logOperation('clear', {}, null, error as Error);
             throw error;
         }
+    }
+
+    /**
+     * Whether the in-memory repository holds changes not yet persisted to
+     * disk — working-tree writes OR internal `.git/` writes (commits, tags,
+     * refs, index) from any mutating operation. O(1).
+     *
+     * Under the write-behind / lazy model this is the signal for *when* to
+     * `flush()`: it flips `true` the moment a commit or tag is created (even
+     * with no working-tree change) and back to `false` once `flush()` has
+     * persisted everything. Flushing on a `false` result is a no-op risk;
+     * skipping a flush while `true` risks losing that state on a worker crash.
+     */
+    isDirty(): boolean {
+        return this._unpersisted.size > 0;
+    }
+
+    /**
+     * Snapshot of the repo-relative paths mutated in memory but not yet
+     * flushed (e.g. `'src/app.tsx'`, `'.git/refs/tags/v0.0.1'`). Useful for
+     * observability/logging. Allocates a copy — prefer `isDirty()` for a
+     * cheap boolean check.
+     */
+    getDirtyPaths(): readonly string[] {
+        return [...this._unpersisted];
+    }
+
+    /**
+     * Records a memfs path mutated in memory but not yet flushed. Invoked by
+     * the recording fs wrapper on every write/delete/rename/symlink. Keyed
+     * repo-relative (matching the disk snapshot), e.g. `.git/refs/tags/v1`.
+     * @private
+     */
+    private _recordUnpersisted(memPath: string): void {
+        const rel = memPath.startsWith(this.dir + '/')
+            ? memPath.slice(this.dir.length + 1)
+            : memPath;
+        this._unpersisted.add(rel);
     }
 
     /**

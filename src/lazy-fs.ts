@@ -22,6 +22,7 @@ import { promises as fsRealAsync, readFileSync as fsRealReadFileSync, statSync a
 import pathNode from 'path';
 import type { createFsFromVolume } from 'memfs';
 import { hashBuffer } from './disk-sync.js';
+import { normalize } from './fs-path.js';
 
 type MemFs = ReturnType<typeof createFsFromVolume>;
 
@@ -178,11 +179,6 @@ function makeEnoent(memPath: string): NodeJS.ErrnoException {
     err.syscall = 'open';
     err.path = memPath;
     return err;
-}
-
-function normalize(p: string | Buffer | URL): string {
-    const s = typeof p === 'string' ? p : p instanceof URL ? p.pathname : p.toString();
-    return pathNode.posix.normalize(s);
 }
 
 /**
