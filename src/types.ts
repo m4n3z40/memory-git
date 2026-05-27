@@ -68,6 +68,26 @@ export interface MemoryUsage {
     estimatedSizeBytes: number;
     estimatedSizeMB: string;
     operationsLogged: number;
+    /**
+     * Per-area split of the resident bytes, so callers can see where an
+     * instance's memory actually goes: working tree vs the git object store,
+     * and within `.git` whether it's packs or loose objects. Computed by a
+     * cheap stat walk over the in-memory volume — no Volume clone. Binary
+     * (Buffer) content is counted by its real byte length.
+     */
+    breakdown: {
+        workingTree: { files: number; bytes: number };
+        git: {
+            files: number;
+            bytes: number;
+            /** Bytes in `.git/objects/pack/`. */
+            packBytes: number;
+            /** Bytes in loose objects `.git/objects/<2hex>/<rest>`. */
+            looseBytes: number;
+            /** Count of loose objects (each is a separate memfs node). */
+            looseObjects: number;
+        };
+    };
 }
 
 export interface LoadFromDiskOptions {
@@ -89,6 +109,17 @@ export interface LoadFromDiskOptions {
      * so existing callers keep working. Pass `{skipSnapshot:true}` to opt out.
      */
     incremental?: boolean;
+    /**
+     * Force `add('.')` to stage the entire loaded working tree after this load
+     * (default: false). By default a load of a *committed* checkout seeds
+     * nothing — the in-memory index already matches the worktree, so `add('.')`
+     * is a no-op until something is written in memory (writes are tracked
+     * automatically, including builds writing through `toJustBashFs(mg)`). A
+     * fresh import with an unborn HEAD always seeds the whole tree regardless of
+     * this flag. Set `true` only when loading a checkout with pre-existing
+     * unstaged/untracked working-tree state you want `add('.')` to pick up.
+     */
+    stageWorkingTree?: boolean;
 }
 
 export interface FlushOptions {
@@ -134,6 +165,15 @@ export interface MemoryGitOptions {
      * memory.
      */
     lazy?: boolean;
+    /**
+     * Cap the in-memory operation log at this many entries (default: unbounded).
+     * The log grows by one small entry per operation and is never trimmed
+     * otherwise, so long-lived/pooled instances accumulate it indefinitely.
+     * Set a bound (e.g. 10_000) to keep it a ring buffer — the oldest entries
+     * are dropped once the cap is exceeded. `getOperationsLog()`/`exportJson()`
+     * then return only the retained tail.
+     */
+    maxLogEntries?: number;
 }
 
 export interface CloneOptions {

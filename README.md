@@ -136,11 +136,11 @@ The class-based API is fully typed and remains the preferred entry point when yo
 
 | Method | Description |
 |--------|-------------|
-| `new MemoryGit(name?, options?)` | Creates instance with isolated volume. `{tracksDiskSnapshot, lazy}` — `lazy:true` defers reading file contents until first access (see [Lazy mode](#lazy-mode)) |
+| `new MemoryGit(name?, options?)` | Creates instance with isolated volume. `{tracksDiskSnapshot, lazy, maxLogEntries}` — `lazy:true` defers reading file contents until first access (see [Lazy mode](#lazy-mode)); `maxLogEntries` caps the operation log (ring buffer, default unbounded — set a bound on long-lived/pooled instances) |
 | `setAuthor(name, email)` | Sets commit author |
 | `config(key, value?)` | Get/set git config (special-cases `user.name`/`user.email` to sync with author) |
 | `init(options?)` | Initializes empty repo. `{defaultBranch, bare}` |
-| `loadFromDisk(path, options?)` | Loads existing repo. `{respectGitignore, nestedGitignore, ignore, skipSnapshot}` — builds a fingerprint snapshot by default so subsequent `flush` calls are incremental; pass `skipSnapshot:true` to skip the hash pass |
+| `loadFromDisk(path, options?)` | Loads existing repo. `{respectGitignore, nestedGitignore, ignore, skipSnapshot, stageWorkingTree}` — builds a fingerprint snapshot by default so subsequent `flush` calls are incremental; pass `skipSnapshot:true` to skip the hash pass. Loading a **committed** checkout leaves `add('.')` a no-op until you write in memory (writes are tracked automatically, including via `toJustBashFs`); a fresh import (unborn HEAD) seeds the whole tree. Pass `stageWorkingTree:true` to force `add('.')` to stage a loaded worktree with pre-existing unstaged/untracked changes |
 | `clone(url, options?)` | Clones remote. `{branch, depth, singleBranch, noCheckout}` |
 | `clear()` | Resets memory state |
 | `flush(targetPath?, options?)` | Syncs memory to disk. `{clean, force}` — incremental by default; `force:true` does a full rewrite |
@@ -248,7 +248,7 @@ Every method records an entry in the operation log. This is what makes MemoryGit
 | `exportOperationsLog()` | JSON string suitable for storing or feeding back to a model |
 | `clearOperationsLog()` | Reset the log |
 | `onOperation(cb)` | Subscribe to log entries as they're recorded; returns an unsubscribe function |
-| `getMemoryUsage()` | Estimated bytes / file count |
+| `getMemoryUsage()` | Resident bytes / file count via a cheap stat walk (no Volume clone). Includes a `breakdown` of working tree vs `.git`, and pack / loose / `looseObjects` within `.git` — use it to see where an instance's memory goes and when to `gc()` |
 | `getRepoInfo()` | Repo summary |
 
 ```typescript

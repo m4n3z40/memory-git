@@ -15,6 +15,16 @@ import type { OperationLogEntry, OperationListener, OperationStats } from './typ
 export class OperationLog {
     private entries: OperationLogEntry[] = [];
     private listeners: Set<OperationListener> = new Set();
+    /** Max retained entries; oldest are dropped past this. Infinity = unbounded. */
+    private readonly maxEntries: number;
+
+    /**
+     * @param maxEntries Cap on retained entries (ring buffer). Defaults to
+     * unbounded; pass a positive number to bound memory on long-lived instances.
+     */
+    constructor(maxEntries: number = Infinity) {
+        this.maxEntries = Number.isFinite(maxEntries) && maxEntries > 0 ? maxEntries : Infinity;
+    }
 
     /**
      * Records an operation entry and notifies all subscribers. Listener
@@ -36,6 +46,11 @@ export class OperationLog {
             error: error ? error.message : null,
         };
         this.entries.push(entry);
+        // Ring-buffer trim: drop the oldest once we exceed the cap. With a
+        // per-push trim the overflow is at most one, but splice handles any.
+        if (this.entries.length > this.maxEntries) {
+            this.entries.splice(0, this.entries.length - this.maxEntries);
+        }
         for (const cb of this.listeners) {
             try { cb(entry); } catch (e) {
                 if (process.env.MEMORY_GIT_DEBUG) console.error('onOperation listener threw:', e);

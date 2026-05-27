@@ -237,6 +237,9 @@ export class MemoryGit {
      */
     constructor(name: string = 'memory-git', options: MemoryGitOptions = {}) {
         this.name = name;
+        if (options.maxLogEntries !== undefined) {
+            this._log = new OperationLog(options.maxLogEntries);
+        }
         this.vol = new Volume();
         const rawFs = createFsFromVolume(this.vol);
         this._rawFs = rawFs;
@@ -694,17 +697,35 @@ export class MemoryGit {
                 }, { success: true, filesLoaded: fileCount });
             }
 
-            // After load, every working-tree file is unsynced with the (likely empty) index.
-            // Seed the dirty set so `add('.')` can pick them all up without rescanning.
-            for (const f of listFilesRecursive(this.fs, this.dir)) {
-                this._dirtyFiles.add(f);
+            // Just hydrated from disk: memory mirrors disk, nothing is pending.
+            // The eager copy writes through this.fs (the recorder, which also
+            // feeds _dirtyFiles), so reset both dirty views. Lazy load doesn't
+            // eager-write, so these are already empty.
+            this._unpersisted.clear();
+            this._dirtyFiles.clear();
+
+            // Seed the add('.') fast-path only when add('.') would otherwise
+            // miss files it must stage:
+            //  - lazy mode keeps the legacy "seed everything" (enumerated via
+            //    lstat without faulting bytes in); probing HEAD here would
+            //    materialize refs and defeat lazy loading.
+            //  - eager mode seeds only on a fresh import (unborn HEAD). A loaded
+            //    *committed* checkout already has an index matching its worktree,
+            //    so add('.') stays a cheap no-op until something is written in
+            //    memory — the recorder catches those writes (incl. builds via
+            //    toJustBashFs), so they are never missed.
+            // {stageWorkingTree:true} forces a full seed for the rare
+            // loaded-but-dirty/untracked-worktree case.
+            const seedAll =
+                options.stageWorkingTree === true ||
+                this._lazy ||
+                !(await this._headResolves());
+            if (seedAll) {
+                for (const f of listFilesRecursive(this.fs, this.dir)) {
+                    this._dirtyFiles.add(f);
+                }
             }
 
-            // Just hydrated from disk: memory mirrors disk, nothing is pending.
-            // (Eager copy writes through this.fs, which would otherwise look
-            // dirty.) Lazy materialization bypasses the recorder, so this is a
-            // belt-and-suspenders clear for the eager path.
-            this._unpersisted.clear();
             this.isInitialized = true;
             return fileCount;
         } catch (error) {
@@ -3471,10 +3492,27 @@ export class MemoryGit {
      * @private
      */
     private _recordUnpersisted(memPath: string): void {
-        const rel = memPath.startsWith(this.dir + '/')
-            ? memPath.slice(this.dir.length + 1)
-            : memPath;
+        const underDir = memPath.startsWith(this.dir + '/');
+        const rel = underDir ? memPath.slice(this.dir.length + 1) : memPath;
         this._unpersisted.add(rel);
+        // Mirror working-tree mutations into the add('.') fast-path set. Writes
+        // that bypass writeFile()/deleteFile() — notably a build writing through
+        // toJustBashFs(mg), which targets the same recording fs — would
+        // otherwise be invisible to add('.') and silently dropped. `.git/`
+        // internals (objects/refs/index/HEAD) are never staged, so skip them.
+        if (underDir && rel.length > 0 && rel !== '.git' && !rel.startsWith('.git/')) {
+            this._dirtyFiles.add(rel);
+        }
+    }
+
+    /** True when HEAD points at a real commit; false on an unborn/missing HEAD. */
+    private async _headResolves(): Promise<boolean> {
+        try {
+            await git.resolveRef({ fs: this.fs, dir: this.dir, ref: 'HEAD' });
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     /**
@@ -3663,23 +3701,67 @@ export class MemoryGit {
 
 
     /**
-     * Gets estimated memory usage
+     * Gets estimated memory usage, split by working tree vs the git object
+     * store (and packs vs loose within `.git`).
+     *
+     * Walks the in-memory volume with one `lstat` per file — it does NOT clone
+     * the Volume (the old `vol.toJSON()` path transiently doubled an instance's
+     * RAM and counted binary content as 0 bytes). Reads the raw (unwrapped)
+     * volume, so lazy files that were never materialized are correctly excluded
+     * — they're on disk, not in memory.
      * @returns Memory usage information
      */
     getMemoryUsage(): MemoryUsage {
-        const json = this.vol.toJSON();
-        const totalSize = Object.values(json).reduce((acc, content) => {
-            if (typeof content === 'string') {
-                return acc + content.length;
+        let files = 0;
+        let totalBytes = 0;
+        let wtFiles = 0;
+        let wtBytes = 0;
+        let gitFiles = 0;
+        let gitBytes = 0;
+        let packBytes = 0;
+        let looseBytes = 0;
+        let looseObjects = 0;
+
+        let paths: string[];
+        try {
+            paths = listFilesRecursive(this._rawFs, this.dir, '', true);
+        } catch {
+            paths = []; // dir not present yet (uninitialized instance)
+        }
+
+        for (const rel of paths) {
+            let size: number;
+            try {
+                size = (this._rawFs.lstatSync(pathNode.posix.join(this.dir, rel)) as { size: number }).size;
+            } catch {
+                continue; // vanished mid-walk
             }
-            return acc;
-        }, 0);
-        
+            files += 1;
+            totalBytes += size;
+            if (rel === '.git' || rel.startsWith('.git/')) {
+                gitFiles += 1;
+                gitBytes += size;
+                if (/^\.git\/objects\/pack\//.test(rel)) {
+                    packBytes += size;
+                } else if (/^\.git\/objects\/[0-9a-f]{2}\//.test(rel)) {
+                    looseBytes += size;
+                    looseObjects += 1;
+                }
+            } else {
+                wtFiles += 1;
+                wtBytes += size;
+            }
+        }
+
         return {
-            files: Object.keys(json).length,
-            estimatedSizeBytes: totalSize,
-            estimatedSizeMB: (totalSize / 1024 / 1024).toFixed(2),
-            operationsLogged: this._log.size
+            files,
+            estimatedSizeBytes: totalBytes,
+            estimatedSizeMB: (totalBytes / 1024 / 1024).toFixed(2),
+            operationsLogged: this._log.size,
+            breakdown: {
+                workingTree: { files: wtFiles, bytes: wtBytes },
+                git: { files: gitFiles, bytes: gitBytes, packBytes, looseBytes, looseObjects },
+            },
         };
     }
 }
