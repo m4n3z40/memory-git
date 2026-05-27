@@ -1,4 +1,5 @@
 import git from 'isomorphic-git';
+import type { TreeEntry } from 'isomorphic-git';
 import http from 'isomorphic-git/http/node';
 import { createFsFromVolume, Volume } from 'memfs';
 import { promises as fsRealAsync } from 'fs';
@@ -23,6 +24,9 @@ import {
 import { LazyState, wrapLazyFs } from './lazy-fs.js';
 import { getCommand, type Command } from './commands/index.js';
 import { primeSafeCompression } from './compression-fix.js';
+
+// git's canonical empty-tree object id (`git hash-object -t tree /dev/null`).
+const EMPTY_TREE_OID = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
 export { primeSafeCompression, shouldForcePako } from './compression-fix.js';
 
@@ -1245,6 +1249,24 @@ export class MemoryGit {
             // git CLI writes ORIG_HEAD unconditionally before the merge starts.
             this._writeGitStateFile('ORIG_HEAD', `${oursOid}\n`);
 
+            // A merge strategy (ours/theirs) asks for deterministic, marker-free
+            // conflict resolution. isomorphic-git's git.merge only applies the
+            // strategy to blob-content conflicts; it throws on tree-level
+            // conflicts (modify/delete, file<->dir type changes) and on some
+            // divergent tree shapes (raw `undefined.length` TypeErrors), which
+            // aborts the caller's sync. Resolve the whole merge ourselves so
+            // `-X ours`/`-X theirs` can never abort — see _mergeWithStrategy.
+            if (options.strategy) {
+                const strategyResult = await this._mergeWithStrategy(
+                    oursOid,
+                    theirsOid,
+                    options.strategy,
+                    options,
+                );
+                this._logOperation('merge', { theirBranch, options }, { success: true, ...strategyResult });
+                return strategyResult;
+            }
+
             const result = await git.merge({
                 fs: this.fs,
                 dir: this.dir,
@@ -1257,7 +1279,6 @@ export class MemoryGit {
                 fastForwardOnly: options.fastForwardOnly,
                 message: options.message,
                 allowUnrelatedHistories: options.allowUnrelatedHistories,
-                mergeDriver: options.strategy ? this._strategyMergeDriver(options.strategy) : undefined,
             });
             // isomorphic-git's merge moves HEAD but does not refresh the
             // working tree (see its docs at merge.md). Force a checkout so
@@ -1310,13 +1331,171 @@ export class MemoryGit {
     }
 
     /**
-     * Returns a mergeDriver that resolves every conflict by taking either
-     * our side (contents[1]) or their side (contents[2]) wholesale — the
-     * isomorphic-git equivalent of `git merge --strategy-option=ours|theirs`.
+     * Deterministically merges `theirsOid` into `oursOid`, resolving every
+     * conflict to `strategy`'s side, then commits + checks out the result.
+     * Unlike isomorphic-git's `git.merge`, this never throws on modify/delete,
+     * file<->directory type changes, or unrelated-history shapes — such
+     * conflicts resolve wholesale to the chosen side. Backs `git merge
+     * -X ours|theirs` (e.g. the pods-manager GitHub sync).
      */
-    private _strategyMergeDriver(strategy: 'ours' | 'theirs'): (args: { contents: string[] }) => { cleanMerge: true; mergedText: string } {
-        const pick = strategy === 'ours' ? 1 : 2;
-        return ({ contents }) => ({ cleanMerge: true, mergedText: contents[pick] });
+    private async _mergeWithStrategy(
+        oursOid: string,
+        theirsOid: string,
+        strategy: 'ours' | 'theirs',
+        options: MergeOptions,
+    ): Promise<MergeResult> {
+        const fs = this.fs;
+        const dir = this.dir;
+
+        // Up to date: theirs is already reachable from ours.
+        if (
+            theirsOid === oursOid ||
+            (await git.isDescendent({ fs, dir, oid: oursOid, ancestor: theirsOid, depth: -1 }))
+        ) {
+            this._dirtyFiles.clear();
+            this._clearMergeStateFiles();
+            return { oid: oursOid, alreadyMerged: true };
+        }
+
+        // Fast-forward: ours is fully contained in theirs, so ours carries no
+        // independent change for the strategy to prefer — advance to theirs.
+        if (!options.noFastForward) {
+            const canFastForward = await git.isDescendent({
+                fs,
+                dir,
+                oid: theirsOid,
+                ancestor: oursOid,
+                depth: -1,
+            });
+            if (canFastForward) {
+                await this._updateHeadTo(theirsOid);
+                await git.checkout({ fs, dir, ref: 'HEAD', force: true });
+                this._dirtyFiles.clear();
+                this._clearMergeStateFiles();
+                return { oid: theirsOid, fastForward: true };
+            }
+        }
+        if (options.fastForwardOnly) {
+            throw new Error('fatal: Not possible to fast-forward, aborting.');
+        }
+
+        // Diverged (shared ancestor) or unrelated: build the merged tree via a
+        // 3-way walk, resolving every conflict to the chosen side, then commit.
+        const mergeBases = await git.findMergeBase({ fs, dir, oids: [oursOid, theirsOid] });
+        const baseTree =
+            mergeBases.length === 1
+                ? (await git.readCommit({ fs, dir, oid: mergeBases[0] })).commit.tree
+                : EMPTY_TREE_OID; // 0 = unrelated, >1 = criss-cross: empty base, strategy decides
+        const ourTree = (await git.readCommit({ fs, dir, oid: oursOid })).commit.tree;
+        const theirTree = (await git.readCommit({ fs, dir, oid: theirsOid })).commit.tree;
+        const mergedTree = await this._mergeTreesWithStrategy(baseTree, ourTree, theirTree, strategy);
+
+        const branchName = (await this.currentBranch()) ?? 'HEAD';
+        const author = {
+            ...this.author,
+            timestamp: Math.floor(Date.now() / 1000),
+            timezoneOffset: new Date().getTimezoneOffset(),
+        };
+        const commitOid = await git.writeCommit({
+            fs,
+            dir,
+            commit: {
+                tree: mergedTree,
+                parent: [oursOid, theirsOid],
+                author,
+                committer: author,
+                message: options.message ?? `Merge commit '${theirsOid}' into ${branchName}\n`,
+            },
+        });
+        await this._updateHeadTo(commitOid);
+        await git.checkout({ fs, dir, ref: 'HEAD', force: true });
+        this._dirtyFiles.clear();
+        this._clearMergeStateFiles();
+        return { oid: commitOid };
+    }
+
+    /**
+     * Recursively builds a merged tree from a 3-way (base/ours/theirs) walk.
+     * Non-conflicting changes from either side are kept as-is; any path both
+     * sides changed (content, deletion, or blob<->tree type change) resolves
+     * wholesale to `strategy`'s side. Returns the merged tree OID.
+     */
+    private async _mergeTreesWithStrategy(
+        baseTreeOid: string,
+        ourTreeOid: string,
+        theirTreeOid: string,
+        strategy: 'ours' | 'theirs',
+    ): Promise<string> {
+        if (ourTreeOid === theirTreeOid) return ourTreeOid;
+
+        const [base, ours, theirs] = await Promise.all([
+            this._readTreeEntries(baseTreeOid),
+            this._readTreeEntries(ourTreeOid),
+            this._readTreeEntries(theirTreeOid),
+        ]);
+        const baseByPath = new Map(base.map(e => [e.path, e]));
+        const ourByPath = new Map(ours.map(e => [e.path, e]));
+        const theirByPath = new Map(theirs.map(e => [e.path, e]));
+
+        // Paths present only in base were deleted on both sides — drop them.
+        const paths = new Set([...ourByPath.keys(), ...theirByPath.keys()]);
+        const merged: TreeEntry[] = [];
+
+        for (const path of paths) {
+            const b = baseByPath.get(path);
+            const o = ourByPath.get(path);
+            const t = theirByPath.get(path);
+
+            // Both sides keep a directory here: recurse so new files from either
+            // side survive (a whole-side pick would drop the other's additions).
+            if (o?.type === 'tree' && t?.type === 'tree') {
+                const sub = await this._mergeTreesWithStrategy(
+                    b?.type === 'tree' ? b.oid : EMPTY_TREE_OID,
+                    o.oid,
+                    t.oid,
+                    strategy,
+                );
+                merged.push({ mode: '040000', path, oid: sub, type: 'tree' });
+                continue;
+            }
+
+            const ourChanged = !this._sameTreeEntry(o, b);
+            const theirChanged = !this._sameTreeEntry(t, b);
+
+            let chosen: TreeEntry | undefined;
+            if (!ourChanged) chosen = t; // only theirs changed (or neither)
+            else if (!theirChanged) chosen = o; // only ours changed
+            else chosen = strategy === 'ours' ? o : t; // both changed → strategy wins
+
+            // `undefined` means the chosen side deleted the path → omit it.
+            if (chosen) merged.push(chosen);
+        }
+
+        return git.writeTree({ fs: this.fs, dir: this.dir, tree: merged });
+    }
+
+    /** Tree entries are equal when both are absent, or share OID + mode. */
+    private _sameTreeEntry(a: TreeEntry | undefined, b: TreeEntry | undefined): boolean {
+        if (!a && !b) return true;
+        if (!a || !b) return false;
+        return a.oid === b.oid && a.mode === b.mode;
+    }
+
+    /** Reads a tree's entries, treating the empty-tree / missing OID as empty. */
+    private async _readTreeEntries(treeOid: string | undefined): Promise<TreeEntry[]> {
+        if (!treeOid || treeOid === EMPTY_TREE_OID) return [];
+        const { tree } = await git.readTree({ fs: this.fs, dir: this.dir, oid: treeOid });
+        return tree;
+    }
+
+    /** Points the current branch (or detached HEAD) at `oid`. */
+    private async _updateHeadTo(oid: string): Promise<void> {
+        const branch = await this._getCurrentBranch();
+        if (branch) {
+            await git.writeRef({ fs: this.fs, dir: this.dir, ref: `refs/heads/${branch}`, value: oid, force: true });
+        } else {
+            this._writeGitStateFile('HEAD', `${oid}\n`); // detached HEAD
+        }
     }
 
     private _writeGitStateFile(name: string, content: string): void {
