@@ -103,7 +103,8 @@ await mg.exec('git config user.name "Agent"');
 | `config` | `<key> [<value>]` |
 | `stash` | `push` (default), `pop`, `list` |
 | `rev-parse` | `<ref>`, `--short`, `--abbrev-ref` |
-| `rev-list` | `<ref>`, `--all`, `--reverse`, `-n/--max-count <n>` |
+| `rev-list` | `<ref>` or `<A>..<B>` (range: commits reachable from B not from A), `--all`, `--reverse`, `-n/--max-count <n>`, `--count` (print just the number) |
+| `merge-base` | `--is-ancestor <maybeAncestor> <descendant>` (only). Returns empty string on success; throws `NotAncestorError` on a negative answer so a shell strategy can map to exit 1 with empty stderr — `instanceof NotAncestorError` distinguishes that from a real failure |
 | `ls-files` | — |
 | `gc` | `--quiet`, `--aggressive` (no-op), `--prune=<date>` (always behaves as `--prune=now`) |
 
@@ -179,7 +180,9 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `logText(options?)` | `{oneline}` |
 | `show(ref?)` | Commit metadata + changed files |
 | `resolveRef(ref?, options?)` | `git rev-parse`. `{short, abbrevRef}`. Accepts short OIDs |
-| `revList(options?)` | `{all, reverse, maxCount, ref}` |
+| `revList(options?)` | `{all, reverse, maxCount, ref, range}` — `range:{from,to}` lists commits reachable from `to` but not from `from` (mirrors `git rev-list A..B`) |
+| `revListCount(options?)` | Just the count of `revList(options)`. Pair with `range` for "how many commits is FETCH_HEAD ahead of HEAD?" in one call |
+| `isAncestor(maybeAncestor, descendant)` | `true` iff `maybeAncestor` is reachable from `descendant` (reflexive). Mirrors `git merge-base --is-ancestor` |
 | `readFileAtRef(filepath, ref?, options?)` | `{encoding: 'utf8' \| 'buffer'}` |
 | `listTrackedFiles(ref?)` | `git ls-tree -r` |
 | `getChangedFiles(fromRef, toRef?, options?)` | Diff two refs. `{filter}` |

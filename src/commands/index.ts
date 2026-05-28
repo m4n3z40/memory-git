@@ -37,6 +37,7 @@ import showRef from './show-ref.js';
 import describe from './describe.js';
 import gc from './gc.js';
 import packRefs from './pack-refs.js';
+import mergeBase from './merge-base.js';
 
 const REGISTRY = new Map<string, Command>();
 function register(cmd: Command): void {
@@ -71,6 +72,7 @@ register(showRef);
 register(describe);
 register(gc);
 register(packRefs);
+register(mergeBase);
 
 /** Resolve a subcommand by name (or alias). Returns `undefined` if unknown. */
 export function getCommand(name: string): Command | undefined {

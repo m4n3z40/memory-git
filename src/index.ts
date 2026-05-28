@@ -30,6 +30,7 @@ import { primeSafeCompression } from './compression-fix.js';
 const EMPTY_TREE_OID = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
 export { primeSafeCompression, shouldForcePako } from './compression-fix.js';
+export { NotAncestorError } from './errors.js';
 
 type MemFs = ReturnType<typeof createFsFromVolume>;
 
@@ -2491,11 +2492,26 @@ export class MemoryGit {
      */
     async revList(options?: RevListOptions): Promise<string[]> {
         try {
-            const ref = options?.ref ?? 'HEAD';
-
             let oids: string[] = [];
 
-            if (options?.all) {
+            if (options?.range) {
+                // A..B: commits reachable from `to` but not from `from`. Walk
+                // `from` to its roots to build the boundary set, then enumerate
+                // `to` via git.log (topo+date order, matches the single-ref
+                // path) and drop anything in the boundary.
+                const fromOid = await this._resolveAny(options.range.from);
+                const toOid = await this._resolveAny(options.range.to);
+                if (fromOid === toOid) {
+                    oids = [];
+                } else {
+                    const exclude = await this._walkReachable(fromOid);
+                    const commits = await git.log({ fs: this.fs, dir: this.dir, ref: toOid });
+                    for (const c of commits) {
+                        if (!exclude.has(c.oid)) oids.push(c.oid);
+                    }
+                }
+                if (options.maxCount != null) oids = oids.slice(0, options.maxCount);
+            } else if (options?.all) {
                 const branches = await git.listBranches({ fs: this.fs, dir: this.dir });
                 const seen = new Set<string>();
                 // Note: ordering with all:true is per-branch, not topological
@@ -2518,6 +2534,7 @@ export class MemoryGit {
                     }
                 }
             } else {
+                const ref = options?.ref ?? 'HEAD';
                 const resolvedRef = await this._resolveAny(ref);
                 const commits = await git.log({
                     fs: this.fs,
@@ -2538,6 +2555,83 @@ export class MemoryGit {
             this._logOperation('revList', { options }, null, error as Error);
             throw error;
         }
+    }
+
+    /**
+     * Count form of `revList` — returns the number of commits the equivalent
+     * `revList(options)` call would produce. Mirrors `git rev-list --count`.
+     * Most useful with `range`: `revListCount({range:{from:'HEAD',to:'FETCH_HEAD'}})`
+     * answers "how many commits is FETCH_HEAD ahead of HEAD?" in one call.
+     */
+    async revListCount(options?: RevListOptions): Promise<number> {
+        return (await this.revList(options)).length;
+    }
+
+    /**
+     * True iff `maybeAncestor` is reachable from `descendant` by following
+     * commit parents. Reflexive: `isAncestor(A, A)` is true. Mirrors
+     * `git merge-base --is-ancestor`. Both refs accept anything `resolveRef`
+     * understands (HEAD, branch/tag, short SHA, FETCH_HEAD, rev-suffix).
+     * Throws on unresolvable ref.
+     */
+    async isAncestor(maybeAncestor: string, descendant: string): Promise<boolean> {
+        try {
+            const ancOid = await this._resolveAny(maybeAncestor);
+            const descOid = await this._resolveAny(descendant);
+            let isAnc = false;
+            if (ancOid === descOid) {
+                isAnc = true;
+            } else {
+                // BFS from descendant over parents; early-exit on hitting ancOid.
+                const seen = new Set<string>([descOid]);
+                const queue: string[] = [descOid];
+                while (queue.length > 0 && !isAnc) {
+                    const oid = queue.shift()!;
+                    let parent: string[] = [];
+                    try {
+                        const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid });
+                        parent = commit.parent;
+                    } catch {
+                        continue;
+                    }
+                    for (const p of parent) {
+                        if (p === ancOid) { isAnc = true; break; }
+                        if (!seen.has(p)) { seen.add(p); queue.push(p); }
+                    }
+                }
+            }
+            this._logOperation('isAncestor', { maybeAncestor, descendant }, { success: true, isAncestor: isAnc });
+            return isAnc;
+        } catch (error) {
+            this._logOperation('isAncestor', { maybeAncestor, descendant }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * BFS over commit parents from `fromOid`, returning every reachable OID
+     * (inclusive of `fromOid`). Used as the boundary for range/ancestry
+     * queries. Each commit is read at most once; unreadable commits are
+     * skipped so a partially-corrupted history can't deadlock the walk.
+     * @private
+     */
+    private async _walkReachable(fromOid: string): Promise<Set<string>> {
+        const seen = new Set<string>();
+        const queue: string[] = [fromOid];
+        while (queue.length > 0) {
+            const oid = queue.shift()!;
+            if (seen.has(oid)) continue;
+            seen.add(oid);
+            try {
+                const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid });
+                for (const p of commit.parent) {
+                    if (!seen.has(p)) queue.push(p);
+                }
+            } catch {
+                // Skip unreadable commits — the walk continues over what's left.
+            }
+        }
+        return seen;
     }
 
     /** Returns the history of all operations performed. */

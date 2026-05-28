@@ -450,6 +450,14 @@ export interface RevListOptions {
     reverse?: boolean;
     maxCount?: number;
     ref?: string;
+    /**
+     * Range form: commits reachable from `to` but not from `from`. Mirrors
+     * `git rev-list <from>..<to>`. Either side accepts anything resolveRef
+     * understands (HEAD, branch/tag, short SHA, FETCH_HEAD…). When set,
+     * `all` and `ref` are ignored. Pair with the `revListCount` method (or
+     * `git rev-list --count A..B`) when you only need the size.
+     */
+    range?: { from: string; to: string };
 }
 
 export interface GcOptions {
