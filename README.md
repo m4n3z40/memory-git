@@ -200,14 +200,14 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `listBranches()` | Returns `BranchInfo[]`. Cached per instance with in-flight dedup (see [Concurrency](#concurrency-and-caching)); invalidated on any branch create/delete/rename/checkout |
 | `branchText()` | `git branch` text format (current branch prefixed with `*`) |
 | `currentBranch()` | Returns current branch name. Cached per instance with in-flight dedup; invalidated when HEAD moves to another branch |
-| `merge(branch, options?)` | `{noFastForward, fastForwardOnly, message, strategy, allowUnrelatedHistories}`. `strategy: 'ours'\|'theirs'` resolves every conflict by keeping that side wholesale (mirrors `git merge -X ours\|theirs`) |
+| `merge(branch, options?)` | `{noFastForward, fastForwardOnly, message, strategy, allowUnrelatedHistories, author, committer, date}`. `strategy: 'ours'\|'theirs'` resolves every conflict by keeping that side wholesale (mirrors `git merge -X ours\|theirs`). `{author, committer, date}` pin the merge commit's identity for byte-identical OID reproduction vs `git merge` under fixed `GIT_*_DATE` |
 | `abortMerge()` | `git merge --abort`. Restores the working tree to its pre-merge state and clears `MERGE_HEAD`/`MERGE_MSG`/`MERGE_MODE`. Throws if no merge is in progress |
 
 ### Tags
 
 | Method | Description |
 |--------|-------------|
-| `createTag(name, refOrOptions?, options?)` | Lightweight or annotated. `{ref, annotated, message, force}` |
+| `createTag(name, refOrOptions?, options?)` | Lightweight or annotated. `{ref, annotated, message, force, tagger, date}`. For annotated tags, `{tagger, date}` pin the tag-object OID — pass `tagger.timezoneOffset` explicitly (commonly `0`) for byte-identical reproduction vs `git tag -a` under fixed `GIT_COMMITTER_DATE`; lightweight tags carry no tagger and are unaffected |
 | `listTags(options?)` | Tag names. `{limit, offset, reverse}` for pagination |
 | `deleteTag(name)` | `git tag -d` |
 | `describeExact(ref?, options?)` | `git describe --exact-match --tags`. `{skipPeel}` skips the per-loose-tag `readTag` peel for ~5× faster cold path on lightweight-only repos |

@@ -1343,6 +1343,8 @@ export class MemoryGit {
                 return strategyResult;
             }
 
+            const { author: mergeAuthor, committer: mergeCommitter } =
+                this._resolveAuthorCommitter(options.author, options.committer, options.date);
             const result = await git.merge({
                 fs: this.fs,
                 dir: this.dir,
@@ -1350,7 +1352,8 @@ export class MemoryGit {
                 // isomorphic-git's internal resolveRef doesn't choke on refs
                 // it can't parse — most notably FETCH_HEAD's multi-line shape.
                 theirs: theirsOid,
-                author: this.author,
+                author: mergeAuthor,
+                committer: mergeCommitter,
                 fastForward: options.noFastForward ? false : undefined,
                 fastForwardOnly: options.fastForwardOnly,
                 message: options.message,
@@ -1467,11 +1470,15 @@ export class MemoryGit {
         const mergedTree = await this._mergeTreesWithStrategy(baseTree, ourTree, theirTree, strategy);
 
         const branchName = (await this.currentBranch()) ?? 'HEAD';
-        const author = {
-            ...this.author,
-            timestamp: Math.floor(Date.now() / 1000),
-            timezoneOffset: new Date().getTimezoneOffset(),
-        };
+        // Resolve author/committer/date from MergeOptions exactly like the
+        // non-strategy path; without this the strategy merge commit gets
+        // stamped with Date.now() in local TZ and the OID diverges from
+        // `git merge -X ours|theirs` under the same fixed-date env.
+        const { author, committer } = this._resolveAuthorCommitter(
+            options.author,
+            options.committer,
+            options.date,
+        );
         const commitOid = await git.writeCommit({
             fs,
             dir,
@@ -1479,7 +1486,7 @@ export class MemoryGit {
                 tree: mergedTree,
                 parent: [oursOid, theirsOid],
                 author,
-                committer: author,
+                committer,
                 message: options.message ?? `Merge commit '${theirsOid}' into ${branchName}\n`,
             },
         });
@@ -1678,13 +1685,22 @@ export class MemoryGit {
 
             if (annotated) {
                 const oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref });
+                // Same resolution shape as commit/merge so the tag-object OID
+                // is reproducible under fixed `GIT_COMMITTER_DATE`. Without
+                // tagger/date the timestamp is `Date.now()` in local TZ and
+                // the annotated tag-object OID diverges from `git tag -a`.
+                const { author: tagger } = this._resolveAuthorCommitter(
+                    opts.tagger,
+                    undefined,
+                    opts.date,
+                );
                 await git.annotatedTag({
                     fs: this.fs,
                     dir: this.dir,
                     ref: tagName,
                     object: oid,
                     message: opts.message ?? tagName,
-                    tagger: this.author
+                    tagger,
                 });
             } else {
                 await git.tag({ fs: this.fs, dir: this.dir, ref: tagName, object: ref });
@@ -3659,6 +3675,64 @@ export class MemoryGit {
         if (underDir && rel.length > 0 && rel !== '.git' && !rel.startsWith('.git/')) {
             this._dirtyFiles.add(rel);
         }
+    }
+
+    /**
+     * Shared author/committer resolution for any op that creates a commit-like
+     * object (commit, merge, annotated tag). Mirrors the `commit()` shape so
+     * `merge()` and `createTag({annotated})` are byte-identical-reproducible
+     * under the same `{author, committer, date}` triple. Clones inputs so
+     * callers don't have their option objects mutated.
+     *
+     * Without an explicit `date` AND without `timestamp` on the supplied
+     * author/committer, the resulting object inherits whatever timestamp iso-git
+     * stamps at write time — `Date.now()` in the local TZ — which makes the OID
+     * non-deterministic. Pinning `date` (or the timestamps on Author) is
+     * required for OID-stable output.
+     * @private
+     */
+    private _resolveAuthorCommitter(
+        author?: Author,
+        committer?: Author,
+        date?: Date | number,
+    ): {
+        author: Required<Author>;
+        committer: Required<Author>;
+    } {
+        const baseAuthor = author ?? this.author;
+        const baseCommitter = committer ?? author ?? this.author;
+        // Priority: explicit `date` > Author.timestamp > Date.now() (the
+        // iso-git default). Same for tz. This guarantees both returned objects
+        // are fully populated so `git.merge`/`git.writeCommit` get a stable,
+        // typed shape — no `as any` at call sites, no surprise defaulting
+        // inside iso-git on a partial Author.
+        // Priority for each field:
+        //   timestamp: explicit `date` > Author.timestamp > Date.now()
+        //   timezone:  Author.timezoneOffset > derived-from-`date` > local now
+        //
+        // The timezone branch is the subtle one: `new Date(ms).getTimezoneOffset()`
+        // returns the LOCAL tz at that instant, NOT a tz encoded in the input.
+        // JS Dates carry no tz. So when the user supplies `date` alone, we
+        // can't know their intended tz and default to local. For byte-identical
+        // interop vs `git` under `GIT_AUTHOR_DATE='<sec> +0000'`, the caller
+        // must set `Author.timezoneOffset` explicitly (commonly 0). Letting
+        // explicit Author.timezoneOffset win over the date-derived default is
+        // what makes UTC commits reproducible.
+        const ms = date !== undefined
+            ? (date instanceof Date ? date.getTime() : date)
+            : undefined;
+        const dateTs = ms !== undefined ? Math.floor(ms / 1000) : undefined;
+        const dateTz = ms !== undefined ? new Date(ms).getTimezoneOffset() : undefined;
+        const fallbackTs = Math.floor(Date.now() / 1000);
+        const fallbackTz = new Date().getTimezoneOffset();
+        const aTs = dateTs ?? baseAuthor.timestamp ?? fallbackTs;
+        const aTz = baseAuthor.timezoneOffset ?? dateTz ?? fallbackTz;
+        const cTs = dateTs ?? baseCommitter.timestamp ?? aTs;
+        const cTz = baseCommitter.timezoneOffset ?? dateTz ?? aTz;
+        return {
+            author: { name: baseAuthor.name, email: baseAuthor.email, timestamp: aTs, timezoneOffset: aTz },
+            committer: { name: baseCommitter.name, email: baseCommitter.email, timestamp: cTs, timezoneOffset: cTz },
+        };
     }
 
     /** True when HEAD points at a real commit; false on an unborn/missing HEAD. */

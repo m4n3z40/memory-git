@@ -8,6 +8,21 @@
 export interface Author {
     name: string;
     email: string;
+    /**
+     * Unix seconds. When unset on an Author passed to commit/merge/createTag,
+     * the underlying call stamps `Date.now()/1000` at write time — making the
+     * resulting OID non-reproducible. Set this (or the surrounding op's
+     * `date`) for byte-identical interop vs native git under fixed
+     * `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`.
+     */
+    timestamp?: number;
+    /**
+     * Minutes west of UTC (matches `Date.prototype.getTimezoneOffset()`).
+     * iso-git serializes this as `±HHMM` with the sign flipped (positive →
+     * `-`). Defaults to the local timezone at write time when unset; pin for
+     * reproducibility.
+     */
+    timezoneOffset?: number;
 }
 
 export interface OperationLogEntry {
@@ -251,6 +266,27 @@ export interface MergeOptions {
     strategy?: 'ours' | 'theirs';
     /** Allow merging two branches with no common ancestor (--allow-unrelated-histories) */
     allowUnrelatedHistories?: boolean;
+    /**
+     * Override author for the merge commit (mirrors `CommitOptions.author`).
+     * Without this, the configured `mg.author` is used. Pass an `Author` with
+     * `timestamp`/`timezoneOffset` populated for byte-identical reproducibility
+     * vs `git merge` under fixed `GIT_AUTHOR_DATE`.
+     */
+    author?: Author;
+    /**
+     * Override committer for the merge commit. Defaults to `options.author`
+     * (or `mg.author`) when omitted, matching git's behavior under
+     * `GIT_COMMITTER_*` falling back to `GIT_AUTHOR_*`.
+     */
+    committer?: Author;
+    /**
+     * Override timestamp for both author and committer (ms since epoch or
+     * Date). Mirrors `CommitOptions.date`. Without this and without
+     * `timestamp` on `author`/`committer`, the merge commit is stamped with
+     * `Date.now()` in the local timezone — so reproducible builds must pin
+     * this to get byte-identical OIDs vs `git merge`.
+     */
+    date?: Date | number;
 }
 
 export interface CreateTagOptions {
@@ -262,6 +298,20 @@ export interface CreateTagOptions {
     message?: string;
     /** Overwrite existing tag */
     force?: boolean;
+    /**
+     * Override the tagger for an annotated tag (mirrors `CommitOptions.author`
+     * for commits). Without this, the configured `mg.author` is used. Pass
+     * `timestamp`/`timezoneOffset` for byte-identical reproducibility vs
+     * `git tag -a` under fixed `GIT_COMMITTER_DATE`.
+     */
+    tagger?: Author;
+    /**
+     * Override timestamp for the tagger (ms since epoch or Date). Without this
+     * the annotated tag object is stamped with `Date.now()` in the local
+     * timezone, producing a non-deterministic tag OID. Lightweight tags
+     * (default) carry no tagger and are unaffected.
+     */
+    date?: Date | number;
 }
 
 export interface RenameOptions {
