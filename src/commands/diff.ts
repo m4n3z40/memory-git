@@ -15,7 +15,7 @@ const diff: Command = {
     async run({ mg }, args) {
         const a = mri(args, {
             alias: { q: 'quiet' },
-            boolean: ['cached', 'staged', 'name-only', 'name-status', 'quiet'],
+            boolean: ['cached', 'staged', 'name-only', 'name-status', 'quiet', 'stat'],
             string: ['diff-filter'],
         });
         const refs = a._.map(String);
@@ -31,11 +31,13 @@ const diff: Command = {
             err.exitCode = 1;
             throw err;
         }
-        return mg.diffText({
-            ...diffOpts,
-            nameOnly: !!a['name-only'],
-            nameStatus: !!a['name-status'],
-        });
+        // Format precedence matches git: --name-only / --name-status / --stat
+        // pick the shape; otherwise (and by default) emit unified diff.
+        const nameOnly = !!a['name-only'];
+        const nameStatus = !!a['name-status'];
+        const stat = !!a.stat;
+        const unified = !nameOnly && !nameStatus && !stat;
+        return mg.diffText({ ...diffOpts, nameOnly, nameStatus, stat, unified });
     },
 };
 

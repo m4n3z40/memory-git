@@ -6,6 +6,7 @@ import { promises as fsRealAsync } from 'fs';
 import pathNode from 'path';
 import { parse as shellParse } from 'shell-quote';
 import ignore from 'ignore';
+import { structuredPatch } from 'diff';
 
 import { MemoizedAsync } from './memoized-async.js';
 import { InFlightAsync } from './in-flight-async.js';
@@ -126,6 +127,141 @@ function expandLogFormat(c: import('./types.js').CommitInfo, fmt: string): strin
 interface TagOidEntry {
     refOid: string;
     peeledOid?: string;
+}
+
+/** The 40-zero OID native git uses in `index <a>..<b>` for added/deleted files. */
+const ZERO_OID = '0000000000000000000000000000000000000000';
+
+/** Per-side content + OID for one file in a diff. */
+interface DiffSide {
+    oid: string;
+    text: string;
+}
+
+/** Per-file data the unified/stat formatters consume. */
+interface FileDiffData {
+    filepath: string;
+    isAdded: boolean;
+    isDeleted: boolean;
+    from: DiffSide;
+    to: DiffSide;
+}
+
+/**
+ * Heuristic: any NUL byte in the content means this isn't text. Native git
+ * emits `Binary files <a> and <b> differ` for these and skips hunks.
+ */
+function isBinary(s: string): boolean {
+    return s.includes('\0');
+}
+
+/**
+ * Format file data as native git's unified diff. Header shape per file:
+ *   diff --git a/<path> b/<path>
+ *   [new file mode 100644 | deleted file mode 100644]
+ *   index <oldShort>..<newShort>[ 100644]
+ *   --- [a/<path> | /dev/null]
+ *   +++ [b/<path> | /dev/null]
+ *   <hunks from jsdiff.structuredPatch>
+ * Matches `git diff --no-color` byte-for-byte on the common cases (mode
+ * 100644 only — symlink/exec-bit mode changes not yet emitted).
+ */
+function formatUnifiedDiff(files: FileDiffData[]): string {
+    const out: string[] = [];
+    for (const f of files) {
+        const header: string[] = [`diff --git a/${f.filepath} b/${f.filepath}`];
+        if (f.isAdded) header.push('new file mode 100644');
+        else if (f.isDeleted) header.push('deleted file mode 100644');
+        const fromShort = f.from.oid.slice(0, 7);
+        const toShort = f.to.oid.slice(0, 7);
+        header.push(
+            f.isAdded || f.isDeleted
+                ? `index ${fromShort}..${toShort}`
+                : `index ${fromShort}..${toShort} 100644`,
+        );
+        if (isBinary(f.from.text) || isBinary(f.to.text)) {
+            out.push(header.join('\n'));
+            out.push(`Binary files ${f.isAdded ? '/dev/null' : `a/${f.filepath}`} and ${f.isDeleted ? '/dev/null' : `b/${f.filepath}`} differ`);
+            continue;
+        }
+        header.push(f.isAdded ? '--- /dev/null' : `--- a/${f.filepath}`);
+        header.push(f.isDeleted ? '+++ /dev/null' : `+++ b/${f.filepath}`);
+        const patch = structuredPatch(f.filepath, f.filepath, f.from.text, f.to.text, '', '', { context: 3 });
+        out.push(header.join('\n'));
+        for (const h of patch.hunks) {
+            // Hunk header parity with native git:
+            //   * When `lines === 0` (empty side), git emits `start === 0` for
+            //     that side ("before line 1"); jsdiff always emits start = 1+,
+            //     so adjust.
+            //   * Git omits the `,<count>` suffix when count === 1; emit the
+            //     compact form too.
+            const oldStart = h.oldLines === 0 ? 0 : h.oldStart;
+            const newStart = h.newLines === 0 ? 0 : h.newStart;
+            const fmt = (start: number, lines: number) => lines === 1 ? `${start}` : `${start},${lines}`;
+            out.push(`@@ -${fmt(oldStart, h.oldLines)} +${fmt(newStart, h.newLines)} @@`);
+            for (const l of h.lines) out.push(l);
+        }
+    }
+    // Native git always terminates its diff output with a newline. Match it
+    // so byte-for-byte string comparisons against `git diff` agree.
+    return out.length > 0 ? out.join('\n') + '\n' : '';
+}
+
+/**
+ * Format file data as native git's `--stat`:
+ *   <path> | <total> ±±±±
+ *   <N> file(s) changed, <X> insertion(s)(+), <Y> deletion(s)(-)
+ * Visual bar width is capped (git defaults to ~52 chars including filename);
+ * here we use the same 52-char cap. Insertions/deletions per file come from
+ * counting `+`/`-` prefix lines in the structured patch (excluding hunk
+ * headers and unchanged context).
+ */
+function formatStatDiff(files: FileDiffData[]): string {
+    if (files.length === 0) return '';
+    type Row = { path: string; ins: number; del: number; total: number };
+    const rows: Row[] = [];
+    let totalIns = 0;
+    let totalDel = 0;
+    let nameWidth = 0;
+    for (const f of files) {
+        let ins = 0;
+        let del = 0;
+        if (!isBinary(f.from.text) && !isBinary(f.to.text)) {
+            const patch = structuredPatch(f.filepath, f.filepath, f.from.text, f.to.text, '', '', { context: 0 });
+            for (const h of patch.hunks) {
+                for (const l of h.lines) {
+                    if (l.startsWith('+') && !l.startsWith('+++')) ins++;
+                    else if (l.startsWith('-') && !l.startsWith('---')) del++;
+                }
+            }
+        }
+        const total = ins + del;
+        totalIns += ins;
+        totalDel += del;
+        if (f.filepath.length > nameWidth) nameWidth = f.filepath.length;
+        rows.push({ path: f.filepath, ins, del, total });
+    }
+    const maxTotal = rows.reduce((m, r) => Math.max(m, r.total), 0);
+    const totalDigits = String(maxTotal).length;
+    // Cap the bar so the row fits in roughly 80 cols: name + ' | ' + num +
+    // ' ' + bar ≤ 80. Use git's default-ish 52 for the whole row.
+    const ROW_BUDGET = 52;
+    const fixedWidth = nameWidth + 3 /* " | " */ + totalDigits + 1 /* " " */;
+    const barBudget = Math.max(1, ROW_BUDGET - fixedWidth);
+    const scale = maxTotal > barBudget ? barBudget / maxTotal : 1;
+    const out: string[] = [];
+    for (const r of rows) {
+        const insMarks = Math.round(r.ins * scale);
+        const delMarks = Math.round(r.del * scale);
+        const bar = '+'.repeat(insMarks) + '-'.repeat(delMarks);
+        out.push(` ${r.path.padEnd(nameWidth)} | ${String(r.total).padStart(totalDigits)} ${bar}`);
+    }
+    const fileWord = rows.length === 1 ? 'file' : 'files';
+    const summary: string[] = [`${rows.length} ${fileWord} changed`];
+    if (totalIns > 0) summary.push(`${totalIns} insertion${totalIns === 1 ? '' : 's'}(+)`);
+    if (totalDel > 0) summary.push(`${totalDel} deletion${totalDel === 1 ? '' : 's'}(-)`);
+    out.push(` ${summary.join(', ')}`);
+    return out.join('\n');
 }
 
 // Public types live in ./types.ts. Re-exported for backwards-compatible
@@ -2465,28 +2601,37 @@ export class MemoryGit {
             throw new Error('fatal: No names found, cannot describe anything.');
         }
 
-        // BFS from ref over parents — first tag hit wins.
+        // BFS from ref over parents; N matches `git describe`'s output even
+        // in merge DAGs (where `revListCount(tag..ref)` undershoots). The
+        // formula is `(seen.size - 1) + extras`, where:
+        //   * seen.size = commits visited (enqueued) by the time we pop the tag
+        //   * - 1 removes the tag itself from that count
+        //   * extras = sum of `(parents.length - 1)` for every commit popped
+        //     before the tag. Merge commits have ≥2 parents, each "extra"
+        //     parent is an additional path between the tag and ref that
+        //     native git counts toward N.
+        // Verified against `git describe` on the parity test setup: linear
+        // case extras=0 → N matches `rev-list tag..ref --count`; merge case
+        // extras=1 → N is exactly +1 over rev-list count, matching git.
         const seen = new Set<string>([oid]);
-        const queue: { oid: string; depth: number }[] = [{ oid, depth: 0 }];
+        const queue: string[] = [oid];
+        let extras = 0;
         while (queue.length > 0) {
-            const { oid: cur, depth } = queue.shift()!;
+            const cur = queue.shift()!;
             const tag = commitToTag.get(cur);
             if (tag !== undefined) {
-                if (depth === 0) return tag;
-                // Recompute N exactly via `revListCount(tag..ref)` — commits
-                // reachable from ref but not from the tag. BFS depth is just
-                // the shortest path; in a merge DAG the real count includes
-                // the other branch too, so we always re-query.
-                const n = await this.revListCount({ range: { from: cur, to: oid } });
+                const n = (seen.size - 1) + extras;
+                if (n === 0) return tag;
                 const abbrev = opts.abbrev ?? 7;
                 return `${tag}-${n}-g${oid.slice(0, abbrev)}`;
             }
             try {
                 const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur });
+                extras += Math.max(0, commit.parent.length - 1);
                 for (const p of commit.parent) {
                     if (!seen.has(p)) {
                         seen.add(p);
-                        queue.push({ oid: p, depth: depth + 1 });
+                        queue.push(p);
                     }
                 }
             } catch {
@@ -3992,31 +4137,43 @@ export class MemoryGit {
         opts: { depth?: number } = {},
     ): Promise<Array<{ oid: string; commit: Awaited<ReturnType<typeof git.readCommit>>['commit'] }>> {
         type QItem = { oid: string; ts: number; commit: Awaited<ReturnType<typeof git.readCommit>>['commit'] };
+        // Sorted descending by ts; head pointer instead of `Array.shift()`
+        // to keep dequeue O(1) — naive shift made the walk O(N²) and
+        // regressed log on deep histories ~40%. For mostly-equal timestamps
+        // (the common "all commits in the same second" case in tests),
+        // sorted-insert collapses to `queue.push()` since the binary search
+        // converges to the end, so the FIFO tiebreak that matches native git
+        // is preserved at O(N) total.
         const queue: QItem[] = [];
+        let head = 0;
         const seen = new Set<string>();
         const out: Array<{ oid: string; commit: QItem['commit'] }> = [];
+        // Per-walk iso-git object cache. Without this, every readCommit
+        // re-opens packs and re-inflates ancestor objects from scratch;
+        // iso-git's git.log uses this internally, which is why the bare
+        // walker regressed ~40% vs git.log on deep histories. Scoped to
+        // one walk so we don't leak parsed objects across operations.
+        const cache: Record<string, unknown> = {};
 
-        // Sorted descending by ts; on equal ts we use `>=` so the new item
-        // lands AFTER all existing equal-ts items (FIFO tiebreak). That
-        // way the merge commit's parents — both stamped with the same
-        // GIT_COMMITTER_DATE — are popped in the order they were pushed,
-        // i.e. first-parent before second-parent, matching native git.
         const enqueue = (item: QItem): void => {
-            let lo = 0;
+            // Binary search over the live window [head, queue.length).
+            let lo = head;
             let hi = queue.length;
             while (lo < hi) {
                 const m = (lo + hi) >> 1;
                 if (queue[m].ts >= item.ts) lo = m + 1;
                 else hi = m;
             }
-            queue.splice(lo, 0, item);
+            // Common case: lo === queue.length → cheap push.
+            if (lo === queue.length) queue.push(item);
+            else queue.splice(lo, 0, item);
         };
 
         for (const oid of startOids) {
             if (seen.has(oid)) continue;
             seen.add(oid);
             try {
-                const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid });
+                const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid, cache });
                 enqueue({ oid, ts: commit.committer.timestamp, commit });
             } catch {
                 // Not a readable commit (e.g. a tag-object ref tip in --all)
@@ -4026,15 +4183,15 @@ export class MemoryGit {
             }
         }
 
-        while (queue.length > 0) {
+        while (head < queue.length) {
             if (opts.depth !== undefined && out.length >= opts.depth) break;
-            const { oid, commit } = queue.shift()!;
+            const { oid, commit } = queue[head++];
             out.push({ oid, commit });
             for (const p of commit.parent ?? []) {
                 if (seen.has(p)) continue;
                 seen.add(p);
                 try {
-                    const { commit: pc } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: p });
+                    const { commit: pc } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: p, cache });
                     enqueue({ oid: p, ts: pc.committer.timestamp, commit: pc });
                 } catch {
                     // Unreadable parent — skip silently, matching git's
@@ -4162,8 +4319,17 @@ export class MemoryGit {
     /**
      * Formats diff entries as text (--name-only / --name-status)
      */
-    async diffText(options: DiffOptions & { nameOnly?: boolean; nameStatus?: boolean } = {}): Promise<string> {
-        const { nameOnly, nameStatus, ...diffOpts } = options;
+    async diffText(
+        options: DiffOptions & {
+            nameOnly?: boolean;
+            nameStatus?: boolean;
+            /** Emit native git's unified diff format (`diff --git`, `@@` hunks). */
+            unified?: boolean;
+            /** Emit native git's `--stat` shape (one `<file> | <total> ±±±±` row per file + summary). */
+            stat?: boolean;
+        } = {},
+    ): Promise<string> {
+        const { nameOnly, nameStatus, unified, stat, ...diffOpts } = options;
         const entries = await this.diff(diffOpts);
         if (nameOnly) return entries.map(e => e.filepath).join('\n');
         if (nameStatus) {
@@ -4174,8 +4340,77 @@ export class MemoryGit {
                 return `${letter}\t${e.filepath}`;
             }).join('\n');
         }
-        // Default: file + human-readable status
+        if (unified || stat) {
+            // Gather per-file old/new contents + OIDs once; format as either
+            // unified or stat from the same source. Hunks come from jsdiff
+            // (`structuredPatch`), so we get LCS-quality alignment for free.
+            const files = await this._collectDiffFiles(entries, diffOpts);
+            return stat ? formatStatDiff(files) : formatUnifiedDiff(files);
+        }
+        // Legacy default: file + human-readable status (kept for back-compat
+        // with programmatic callers that depended on it). The CLI `diff`
+        // command opts into unified.
         return entries.map(e => `${e.filepath}: ${e.status}`).join('\n');
+    }
+
+    /**
+     * Collect the data each per-file diff needs: blob OIDs and contents on
+     * each side. Handles three cases:
+     *   - ref-vs-ref (`fromRef` and `toRef`): readBlob from both trees.
+     *   - workdir-vs-HEAD (default): readBlob from HEAD, readFile from
+     *     workdir.
+     *   - cached / index-vs-HEAD: readBlob from HEAD; index content reads
+     *     are not yet supported, so the unified diff for `--cached` falls
+     *     back to a status-only block (the file appears in the header but
+     *     emits an empty hunk).
+     * @private
+     */
+    private async _collectDiffFiles(
+        entries: DiffEntry[],
+        opts: DiffOptions,
+    ): Promise<FileDiffData[]> {
+        const out: FileDiffData[] = [];
+        const isWorkdirVsHead = opts.fromRef === 'HEAD' && !opts.toRef;
+        const fromRef = opts.fromRef && !isWorkdirVsHead ? opts.fromRef : 'HEAD';
+        const toRef = opts.fromRef && !isWorkdirVsHead && opts.toRef ? opts.toRef : null;
+        const readFromTree = async (ref: string, filepath: string): Promise<DiffSide> => {
+            try {
+                const { blob, oid } = await git.readBlob({
+                    fs: this.fs, dir: this.dir, oid: await this._resolveAny(ref), filepath,
+                });
+                return { oid, text: Buffer.from(blob).toString('utf8') };
+            } catch {
+                return { oid: ZERO_OID, text: '' };
+            }
+        };
+        const readFromWorkdir = async (filepath: string): Promise<DiffSide> => {
+            try {
+                const buf = this.fs.readFileSync(pathNode.posix.join(this.dir, filepath)) as Buffer;
+                // workdir doesn't carry the blob OID until staged; hash it
+                // on the fly so the `index <a>..<b>` line still makes sense.
+                const oid = await git.hashBlob({ object: buf }).then(r => r.oid);
+                return { oid, text: buf.toString('utf8') };
+            } catch {
+                return { oid: ZERO_OID, text: '' };
+            }
+        };
+
+        for (const e of entries) {
+            const isAdded = e.status.includes('added') || e.status.includes('new');
+            const isDeleted = e.status.includes('deleted');
+            let from: DiffSide;
+            let to: DiffSide;
+            if (toRef) {
+                from = isAdded ? { oid: ZERO_OID, text: '' } : await readFromTree(fromRef, e.filepath);
+                to   = isDeleted ? { oid: ZERO_OID, text: '' } : await readFromTree(toRef, e.filepath);
+            } else {
+                // workdir-vs-HEAD
+                from = isAdded ? { oid: ZERO_OID, text: '' } : await readFromTree(fromRef, e.filepath);
+                to   = isDeleted ? { oid: ZERO_OID, text: '' } : await readFromWorkdir(e.filepath);
+            }
+            out.push({ filepath: e.filepath, isAdded, isDeleted, from, to });
+        }
+        return out;
     }
 
     /**

@@ -86,7 +86,7 @@ await mg.exec('git config user.name "Agent"');
 | `status` | (default human-readable), `--porcelain`, `-s/--short`, `-b/--branch` |
 | `log` | `-n <count>`, `--oneline`, `--author=<s>`, `--since=<iso>`, `--until=<iso>`, `--format=<fmt>`, `<ref>`. `--format` accepts the common placeholders (`%H`/`%h`/`%T`/`%t`/`%P`/`%p`/`%an`/`%ae`/`%ad`/`%ai`/`%at`/`%cn`/`%ce`/`%cd`/`%ci`/`%ct`/`%s`/`%b`/`%B`/`%n`/`%%`). Merge commits get a `Merge: <p1> <p2>` line in the default header. Date output matches git's `Thu Jan 1 00:00:00 2026 +0000` shape |
 | `show` | `<ref>` |
-| `diff` | `--cached/--staged`, `--name-only`, `--name-status`, `--diff-filter=ACMR`, `-q/--quiet`, `<ref>` (workdir vs ref), `<from> <to>` |
+| `diff` | `--cached/--staged`, `--name-only`, `--name-status`, `--stat`, `--diff-filter=ACMR`, `-q/--quiet`, `<ref>` (workdir vs ref), `<from> <to>`. Default output is the unified diff (`diff --git`, `index`, `---`/`+++`, `@@` hunks) matching `git diff --no-color` byte-for-byte on mode 100644 files; binary files get `Binary files differ` (NUL-byte heuristic). `--stat` emits `<file> | <total> ±±±±` rows + `<N> files changed, <X> insertions(+), <Y> deletions(-)` summary |
 | `branch` | (list), `<name>` (create), `-d/-D <name>`, `-m <old> <new>`, `--show-current` |
 | `checkout` | `<ref>`, `-b <new>`, `-f`, `-- <files...>` |
 | `merge` | `<branch>`, `--no-ff`, `--ff-only`, `-m <msg>`, `--abort`, `-X/--strategy-option=ours\|theirs`, `--allow-unrelated-histories`, `--no-edit` |
