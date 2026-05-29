@@ -34,6 +34,89 @@ export { primeSafeCompression, shouldForcePako } from './compression-fix.js';
 type MemFs = ReturnType<typeof createFsFromVolume>;
 
 /**
+ * Format a Unix-epoch + tz-offset pair in native git's default date shape:
+ * `Thu Jan 1 00:00:00 2026 +0000`. `tzMin` is minutes WEST of UTC (matches
+ * iso-git's `timezoneOffset` and JS `Date.prototype.getTimezoneOffset()`);
+ * the emitted ±HHMM has the opposite sign convention (UTC-3 ↔ -0300, west
+ * is negative). Used by log/show/--format=%ad to match `git log` byte-for-
+ * byte on the date line.
+ */
+function formatGitDate(isoTs: string, tzMin: number = 0): string {
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    // Shift the timestamp so getUTC* reads the wall-clock time at the
+    // commit's recorded tz. (`new Date(iso)` gives the absolute instant; we
+    // can't read it in an arbitrary tz directly in vanilla JS.)
+    const adj = new Date(new Date(isoTs).getTime() - tzMin * 60_000);
+    const day = days[adj.getUTCDay()];
+    const mon = months[adj.getUTCMonth()];
+    const date = adj.getUTCDate();
+    const hh = String(adj.getUTCHours()).padStart(2, '0');
+    const mm = String(adj.getUTCMinutes()).padStart(2, '0');
+    const ss = String(adj.getUTCSeconds()).padStart(2, '0');
+    const year = adj.getUTCFullYear();
+    const sign = tzMin > 0 ? '-' : '+';
+    const abs = Math.abs(tzMin);
+    const tzH = String(Math.floor(abs / 60)).padStart(2, '0');
+    const tzM = String(abs % 60).padStart(2, '0');
+    return `${day} ${mon} ${date} ${hh}:${mm}:${ss} ${year} ${sign}${tzH}${tzM}`;
+}
+
+/**
+ * Expand `git log --format=<fmt>` placeholders against a {@link CommitInfo}.
+ * Supports the common subset that covers nearly every real-world `--format`:
+ *   %H/%h  full/short commit hash      %T/%t  full/short tree hash
+ *   %P/%p  full/short parents          %s     subject (first message line)
+ *   %b     body (message minus subject) %B     raw body (full message)
+ *   %an/%ae/%ad/%ai/%at  author name/email/default-date/ISO/Unix
+ *   %cn/%ce/%cd/%ci/%ct  committer name/email/default-date/ISO/Unix
+ *   %n     literal newline             %%     literal percent
+ *
+ * Date placeholders' formatting:
+ *   %ad/%cd  → `new Date(timestamp).toString()` (matches mg's existing log header)
+ *   %ai/%ci  → ISO 8601 string (already in CommitInfo.timestamp)
+ *   %at/%ct  → Unix seconds
+ *
+ * Unknown codes pass through as the literal `%<code>`, matching git's lenient
+ * behavior on uncommon formats.
+ */
+function expandLogFormat(c: import('./types.js').CommitInfo, fmt: string): string {
+    const cTs = c.committer?.timestamp ?? c.timestamp;
+    const cName = c.committer?.name ?? c.author;
+    const cEmail = c.committer?.email ?? c.email;
+    const subject = c.message.trim().split('\n')[0];
+    const bodyLines = c.message.trim().split('\n').slice(1);
+    while (bodyLines.length > 0 && bodyLines[0].trim() === '') bodyLines.shift();
+    const body = bodyLines.join('\n');
+    return fmt.replace(/%([ac][neaditR]|[HhTtPpsBbn%])/g, (full, code: string) => {
+        switch (code) {
+            case 'H': return c.sha;
+            case 'h': return c.sha.slice(0, 7);
+            case 'T': return c.tree ?? '';
+            case 't': return (c.tree ?? '').slice(0, 7);
+            case 'P': return (c.parents ?? []).join(' ');
+            case 'p': return (c.parents ?? []).map(p => p.slice(0, 7)).join(' ');
+            case 's': return subject;
+            case 'b': return body;
+            case 'B': return c.message;
+            case 'n': return '\n';
+            case '%': return '%';
+            case 'an': return c.author;
+            case 'ae': return c.email;
+            case 'ad': return formatGitDate(c.timestamp, c.authorTzMin);
+            case 'ai': return c.timestamp;
+            case 'at': return String(Math.floor(new Date(c.timestamp).getTime() / 1000));
+            case 'cn': return cName;
+            case 'ce': return cEmail;
+            case 'cd': return formatGitDate(cTs, c.committer?.tzMin);
+            case 'ci': return cTs;
+            case 'ct': return String(Math.floor(new Date(cTs).getTime() / 1000));
+            default: return full;
+        }
+    });
+}
+
+/**
  * Internal tag-store entry. `refOid` is what the ref file/packed-refs line
  * stores — a commit OID for lightweight tags, a tag-object OID for
  * annotated. `peeledOid` is the commit OID the annotated tag points at, set
@@ -82,6 +165,8 @@ import type {
     ResetMode,
     ResetOptions,
     TagRef,
+    RefRow,
+    ShowRefsOptions,
     ListTagsOptions,
     ShowTagRefsOptions,
     TagsPointingAtOptions,
@@ -128,6 +213,8 @@ export type {
     ResetMode,
     ResetOptions,
     TagRef,
+    RefRow,
+    ShowRefsOptions,
     ListTagsOptions,
     ShowTagRefsOptions,
     TagsPointingAtOptions,
@@ -1153,7 +1240,16 @@ export class MemoryGit {
                     message: commit.commit.message,
                     author: commit.commit.author.name,
                     email: commit.commit.author.email,
-                    timestamp: new Date(commit.commit.author.timestamp * 1000).toISOString()
+                    timestamp: new Date(commit.commit.author.timestamp * 1000).toISOString(),
+                    authorTzMin: commit.commit.author.timezoneOffset,
+                    parents: commit.commit.parent ?? [],
+                    tree: commit.commit.tree,
+                    committer: {
+                        name: commit.commit.committer.name,
+                        email: commit.commit.committer.email,
+                        timestamp: new Date(commit.commit.committer.timestamp * 1000).toISOString(),
+                        tzMin: commit.commit.committer.timezoneOffset,
+                    },
                 }));
 
             this._logOperation('log', { options }, { success: true, commits: result.length });
@@ -2325,6 +2421,78 @@ export class MemoryGit {
      * @param ref - Reference to check (default: 'HEAD')
      * @returns Tag name or null if no tag points to that commit
      */
+    /**
+     * Default `git describe` form: nearest tag plus the distance to HEAD
+     * (commits between tag and ref) and the short hash. Output shapes:
+     *   - `<tag>` when the ref is itself the tagged commit
+     *   - `<tag>-<N>-g<shortSha>` otherwise
+     *
+     * Annotated tags only by default; pass `{tags:true}` to include
+     * lightweight tags (mirrors `git describe --tags`). `{abbrev}` sets the
+     * short-hash width (default 7, native git's `--abbrev=<N>`).
+     *
+     * `N` is the count of commits reachable from `ref` but not from the tag
+     * (matches `git rev-list <tag>..<ref> --count`), so merge DAGs are
+     * counted correctly. Walks via BFS — the first tag hit wins (smallest
+     * BFS distance ≈ smallest N), then we recompute N exactly via
+     * `revListCount` for precision.
+     */
+    async describe(
+        ref: string = 'HEAD',
+        opts: { tags?: boolean; abbrev?: number } = {},
+    ): Promise<string> {
+        const oid = await this._resolveCommit(ref);
+        const tagOids = await this._loadAllTagOids();
+        const includeLightweight = !!opts.tags;
+
+        // Reverse map: commit OID → first matching tag (by iteration order,
+        // which is packed-refs sorted + loose order). Native git prefers the
+        // tag with smallest distance and breaks ties by most-recent
+        // taggerdate; we trade that off for cheap O(1) lookup. Good enough
+        // for the common cases (no overlapping tag on the same commit).
+        const commitToTag = new Map<string, string>();
+        for (const [tagName, entry] of tagOids) {
+            const isAnnotated = entry.peeledOid !== undefined;
+            if (!isAnnotated && !includeLightweight) continue;
+            const commit = this._commitOf(entry);
+            if (!commitToTag.has(commit)) commitToTag.set(commit, tagName);
+        }
+
+        if (commitToTag.size === 0) {
+            throw new Error('fatal: No names found, cannot describe anything.');
+        }
+
+        // BFS from ref over parents — first tag hit wins.
+        const seen = new Set<string>([oid]);
+        const queue: { oid: string; depth: number }[] = [{ oid, depth: 0 }];
+        while (queue.length > 0) {
+            const { oid: cur, depth } = queue.shift()!;
+            const tag = commitToTag.get(cur);
+            if (tag !== undefined) {
+                if (depth === 0) return tag;
+                // Recompute N exactly via `revListCount(tag..ref)` — commits
+                // reachable from ref but not from the tag. BFS depth is just
+                // the shortest path; in a merge DAG the real count includes
+                // the other branch too, so we always re-query.
+                const n = await this.revListCount({ range: { from: cur, to: oid } });
+                const abbrev = opts.abbrev ?? 7;
+                return `${tag}-${n}-g${oid.slice(0, abbrev)}`;
+            }
+            try {
+                const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur });
+                for (const p of commit.parent) {
+                    if (!seen.has(p)) {
+                        seen.add(p);
+                        queue.push({ oid: p, depth: depth + 1 });
+                    }
+                }
+            } catch {
+                // unreadable — skip and continue the walk
+            }
+        }
+        throw new Error('fatal: No names found, cannot describe anything.');
+    }
+
     async describeExact(ref: string = 'HEAD', opts: { skipPeel?: boolean } = {}): Promise<string | null> {
         try {
             const matches = await this.tagsPointingAt(ref, { limit: 1, skipPeel: opts.skipPeel });
@@ -2396,6 +2564,80 @@ export class MemoryGit {
      *   parallel path.
      * @returns Tag refs with commit OIDs.
      */
+    /**
+     * Unified ref listing — mirrors `git show-ref` (no args: heads + tags +
+     * remotes; with `--heads`/`--tags`/etc: filtered). Each row carries the
+     * OID the ref *itself* points at (tag object for annotated tags, commit
+     * for everything else) plus an optional `peeled` field for the
+     * tag-object-to-commit dereference so the bash command can emit the
+     * `^{}` line under `-d`.
+     *
+     * When no flags are set, behaves as if `{heads:true, tags:true,
+     * remotes:true}` — matching native git's default "list every ref".
+     */
+    async showRefs(opts: ShowRefsOptions = {}): Promise<RefRow[]> {
+        try {
+            const wantHeads = opts.heads === true;
+            const wantTags = opts.tags === true;
+            const wantRemotes = opts.remotes === true;
+            const all = !wantHeads && !wantTags && !wantRemotes;
+            const out: RefRow[] = [];
+
+            if (all || wantHeads) {
+                const branches = await git.listBranches({ fs: this.fs, dir: this.dir });
+                for (const b of branches) {
+                    try {
+                        const oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: `refs/heads/${b}` });
+                        out.push({ oid, ref: `refs/heads/${b}` });
+                    } catch {
+                        // Unborn or vanished mid-walk — skip silently, matching git.
+                    }
+                }
+            }
+
+            if (all || wantRemotes) {
+                const remotes = await this.listRemotes();
+                for (const r of remotes) {
+                    let remoteBranches: string[] = [];
+                    try {
+                        remoteBranches = await git.listBranches({ fs: this.fs, dir: this.dir, remote: r.remote });
+                    } catch {
+                        continue;
+                    }
+                    for (const b of remoteBranches) {
+                        // Skip the symbolic `refs/remotes/<r>/HEAD` — native
+                        // show-ref omits it unless `--head` is given (which
+                        // we don't implement).
+                        if (b === 'HEAD') continue;
+                        try {
+                            const oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: `refs/remotes/${r.remote}/${b}` });
+                            out.push({ oid, ref: `refs/remotes/${r.remote}/${b}` });
+                        } catch {
+                            // skip
+                        }
+                    }
+                }
+            }
+
+            if (all || wantTags) {
+                const tagRefs = await this.showTagRefs();
+                for (const t of tagRefs) {
+                    out.push({
+                        oid: t.refOid,
+                        ref: `refs/tags/${t.tagName}`,
+                        peeled: t.refOid !== t.commitOid ? t.commitOid : undefined,
+                    });
+                }
+            }
+
+            this._logOperation('showRefs', { ...opts }, { success: true, count: out.length });
+            return out;
+        } catch (error) {
+            this._logOperation('showRefs', { ...opts }, null, error as Error);
+            throw error;
+        }
+    }
+
     async showTagRefs(opts: ShowTagRefsOptions = {}): Promise<TagRef[]> {
         try {
             // Short-circuit when caller only needs the first `limit` tags
@@ -2527,7 +2769,16 @@ export class MemoryGit {
                 message: obj.commit.message,
                 author: obj.commit.author.name,
                 email: obj.commit.author.email,
-                timestamp: new Date(obj.commit.author.timestamp * 1000).toISOString()
+                timestamp: new Date(obj.commit.author.timestamp * 1000).toISOString(),
+                authorTzMin: obj.commit.author.timezoneOffset,
+                parents: obj.commit.parent ?? [],
+                tree: obj.commit.tree,
+                committer: {
+                    name: obj.commit.committer.name,
+                    email: obj.commit.committer.email,
+                    timestamp: new Date(obj.commit.committer.timestamp * 1000).toISOString(),
+                    tzMin: obj.commit.committer.timezoneOffset,
+                },
             };
 
             let changes: ChangedFile[] = [];
@@ -3824,15 +4075,28 @@ export class MemoryGit {
     /**
      * Formats commit log as text (git log [--oneline])
      */
-    async logText(options: LogOptions & { oneline?: boolean } = {}): Promise<string> {
-        const { oneline, ...logOpts } = options;
+    async logText(options: LogOptions & { oneline?: boolean; format?: string } = {}): Promise<string> {
+        const { oneline, format, ...logOpts } = options;
         const commits = await this.log(logOpts);
+        if (format !== undefined) {
+            // `--format=<fmt>` produces one expanded line per commit. Lines
+            // join with '\n' to match `git log --format=<fmt>` output (no
+            // trailing newline; native git appends one but bash output is
+            // usually consumed line-by-line anyway).
+            return commits.map(c => expandLogFormat(c, format)).join('\n');
+        }
         if (oneline) {
             return commits.map(c => `${c.sha.slice(0, 7)} ${c.message.trim().split('\n')[0]}`).join('\n');
         }
         return commits.map(c => {
-            const date = new Date(c.timestamp).toString();
-            return `commit ${c.sha}\nAuthor: ${c.author} <${c.email}>\nDate:   ${date}\n\n    ${c.message.trim().replace(/\n/g, '\n    ')}\n`;
+            const date = formatGitDate(c.timestamp, c.authorTzMin);
+            const header = [`commit ${c.sha}`];
+            if (c.parents && c.parents.length > 1) {
+                header.push(`Merge: ${c.parents.map(p => p.slice(0, 7)).join(' ')}`);
+            }
+            header.push(`Author: ${c.author} <${c.email}>`);
+            header.push(`Date:   ${date}`);
+            return `${header.join('\n')}\n\n    ${c.message.trim().replace(/\n/g, '\n    ')}\n`;
         }).join('\n');
     }
 

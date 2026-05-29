@@ -84,15 +84,15 @@ await mg.exec('git config user.name "Agent"');
 | `mv` | `<from> <to>`, `-f` |
 | `commit` | `-m <msg>`, `--amend`, `--allow-empty`, `-a/--all`, `--author=<n <e>>`, `--date=<iso>` |
 | `status` | (default human-readable), `--porcelain`, `-s/--short`, `-b/--branch` |
-| `log` | `-n <count>`, `--oneline`, `--author=<s>`, `--since=<iso>`, `--until=<iso>`, `<ref>` |
+| `log` | `-n <count>`, `--oneline`, `--author=<s>`, `--since=<iso>`, `--until=<iso>`, `--format=<fmt>`, `<ref>`. `--format` accepts the common placeholders (`%H`/`%h`/`%T`/`%t`/`%P`/`%p`/`%an`/`%ae`/`%ad`/`%ai`/`%at`/`%cn`/`%ce`/`%cd`/`%ci`/`%ct`/`%s`/`%b`/`%B`/`%n`/`%%`). Merge commits get a `Merge: <p1> <p2>` line in the default header. Date output matches git's `Thu Jan 1 00:00:00 2026 +0000` shape |
 | `show` | `<ref>` |
 | `diff` | `--cached/--staged`, `--name-only`, `--name-status`, `--diff-filter=ACMR`, `-q/--quiet`, `<ref>` (workdir vs ref), `<from> <to>` |
 | `branch` | (list), `<name>` (create), `-d/-D <name>`, `-m <old> <new>`, `--show-current` |
 | `checkout` | `<ref>`, `-b <new>`, `-f`, `-- <files...>` |
 | `merge` | `<branch>`, `--no-ff`, `--ff-only`, `-m <msg>`, `--abort`, `-X/--strategy-option=ours\|theirs`, `--allow-unrelated-histories`, `--no-edit` |
 | `tag` | `<name>`, `-a -m <msg>`, `-d <name>`, `-f`, `-l`, `--points-at <ref>` |
-| `show-ref` | `--tags`, `-d/--dereference` |
-| `describe` | `--exact-match --tags <ref>` |
+| `show-ref` | `[--heads] [--tags] [-d/--dereference]`. No flags = heads + tags + remotes (matches git default). `-d` adds the peeled `^{}` line for annotated tags |
+| `describe` | `[--exact-match] [--tags] [--abbrev=<n>] [<ref>]`. Default emits `<tag>-<N>-g<short>` (or just `<tag>` when ref is the tagged commit). `--exact-match` only matches annotated tags by default (matches git); `--tags` opts in to lightweight too |
 | `pack-refs` | `--all` (default behavior), `--prune` (always on) |
 | `reset` | `--soft`, `--mixed`, `--hard`, `<ref>`, `-- <files...>` |
 | `clone` | `<url>`, `-b/--branch <ref>`, `--depth <n>`, `--single-branch`, `--no-checkout` |
@@ -176,8 +176,10 @@ The class-based API is fully typed and remains the preferred entry point when yo
 
 | Method | Description |
 |--------|-------------|
-| `log(options?)` | `{depth, ref, author, since, until}`. Returns `CommitInfo[]` |
-| `logText(options?)` | `{oneline}` |
+| `log(options?)` | `{depth, ref, author, since, until}`. Returns `CommitInfo[]` (now also carries `parents`, `tree`, `committer`, and tz offsets so log/show can emit byte-identical git-style dates and `Merge:` lines) |
+| `logText(options?)` | `{oneline, format}`. `format` expands `git log --format=<fmt>` placeholders (`%H`/`%h`/`%s`/`%an`/`%ae`/`%ad`/`%ai`/`%at`/`%cn`/`%ce`/`%cd`/`%ct`/`%T`/`%t`/`%P`/`%p`/`%b`/`%B`/`%n`/`%%`) one line per commit |
+| `showRefs(options?)` | `{heads, tags, remotes}` (any unset ⇒ all). Returns `{oid, ref, peeled?}` per ref. Backs `git show-ref` |
+| `describe(ref?, options?)` | `{tags, abbrev}`. Walks parents from `ref` to the nearest tag, emits `<tag>-<N>-g<short>`. `N` is computed via `revListCount(tag..ref)` for merge-DAG accuracy. `--tags` includes lightweight tags |
 | `show(ref?)` | Commit metadata + changed files |
 | `resolveRef(ref?, options?)` | `git rev-parse`. `{short, abbrevRef}`. Accepts short OIDs |
 | `revList(options?)` | `{all, reverse, maxCount, ref, range}` — `range:{from,to}` lists commits reachable from `to` but not from `from` (mirrors `git rev-list A..B`) |

@@ -56,7 +56,29 @@ describe('exec("show-ref")', () => {
         expect(lines).toHaveLength(3); // 2 lines for annotated, 1 for lightweight
     });
 
-    it('rejects show-ref without --tags', async () => {
-        await expect(mg.exec('show-ref')).rejects.toThrow(/only `show-ref --tags`/);
+    it('show-ref without flags lists heads + tags (default = everything, matches git)', async () => {
+        await mg.writeFile('a.txt', '1');
+        await mg.exec('add .');
+        await mg.exec('commit -m init');
+        const head = await mg.resolveRef('HEAD');
+        await mg.exec('tag v1');
+
+        const out = await mg.exec('show-ref');
+        const lines = out.split('\n');
+        expect(lines).toContain(`${head} refs/heads/main`);
+        expect(lines).toContain(`${head} refs/tags/v1`);
+    });
+
+    it('show-ref --heads emits only refs/heads/*', async () => {
+        await mg.writeFile('a.txt', '1');
+        await mg.exec('add .');
+        await mg.exec('commit -m init');
+        const head = await mg.resolveRef('HEAD');
+        await mg.exec('tag v1');
+
+        const out = await mg.exec('show-ref --heads');
+        const lines = out.split('\n');
+        expect(lines).toEqual([`${head} refs/heads/main`]);
+        expect(lines.every(l => !l.includes('refs/tags/'))).toBe(true);
     });
 });

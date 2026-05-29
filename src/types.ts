@@ -48,6 +48,27 @@ export interface CommitInfo {
     author: string;
     email: string;
     timestamp: string;
+    /**
+     * Parent commit OIDs in the same order they appear in the commit object.
+     * Empty for root commits; length ≥ 2 for merge commits. Optional only for
+     * backwards-compatibility — populated by `log()`/`show()` since the
+     * `Merge:` formatter parity work.
+     */
+    parents?: string[];
+    /** Tree OID this commit points at. Optional for back-compat. */
+    tree?: string;
+    /**
+     * Committer info. Distinct from author for amends, cherry-picks, rebases.
+     * Optional for back-compat; populated by `log()`/`show()`.
+     */
+    committer?: { name: string; email: string; timestamp: string; tzMin?: number };
+    /**
+     * Author timezone offset, in minutes west of UTC (matches the JS
+     * `getTimezoneOffset` and iso-git's `timezoneOffset` convention). Used to
+     * format dates in the native git `Thu Jan 1 00:00:00 2026 +0000` shape.
+     * Optional for back-compat.
+     */
+    authorTzMin?: number;
 }
 
 export interface BranchInfo {
@@ -438,6 +459,24 @@ export interface ResetOptions {
     mode?: ResetMode;
     /** Restrict reset to these paths (git reset HEAD -- <paths>). Mode is ignored when present. */
     paths?: string[];
+}
+
+export interface RefRow {
+    /** OID the ref points at. For annotated tags this is the tag-object OID. */
+    oid: string;
+    /** Full ref name: refs/heads/main, refs/tags/v1, refs/remotes/origin/main, etc. */
+    ref: string;
+    /** Peeled commit OID, present only for annotated tags. */
+    peeled?: string;
+}
+
+export interface ShowRefsOptions {
+    /** Include local branches (refs/heads/*). */
+    heads?: boolean;
+    /** Include tags (refs/tags/*). */
+    tags?: boolean;
+    /** Include remote-tracking branches (refs/remotes/*). */
+    remotes?: boolean;
 }
 
 export interface TagRef {

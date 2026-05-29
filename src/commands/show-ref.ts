@@ -2,37 +2,41 @@ import mri from 'mri';
 import type { Command } from './types.js';
 
 /**
- * `git show-ref --tags [-d]`.
+ * `git show-ref [--heads] [--tags] [-d]`.
  *
- * Default emits the OID the ref *itself* stores — for annotated tags that's
- * the tag object's OID (NOT the commit it points at), matching native git.
- * With `-d`/`--dereference`, annotated tags get an additional `^{}` line
- * carrying the peeled commit OID, again matching `git show-ref -d`. The
- * old behavior (emitting the peeled commit OID by default) was a divergence
- * from git that broke callers relying on `show-ref --tags` output to
- * identify the tag object itself (e.g. `git update-ref refs/tags/X <oid>`).
+ * Default (no flags) emits every ref — heads + tags + remotes — matching
+ * native git. `--heads`/`--tags` filter to that subset (combinable). `-d`
+ * adds the peeled `^{}` line for annotated tags (whose ref OID is the
+ * tag-object OID, not the commit).
+ *
+ * Each emitted line is `<oid> <full-ref-name>`; for annotated tags under `-d`
+ * there's a second line `<peeled-commit-oid> refs/tags/<name>^{}`. Matches
+ * `git show-ref` byte-for-byte for the common cases.
  */
 const showRef: Command = {
     names: ['show-ref'],
     async run({ mg }, args) {
         const a = mri(args, {
             alias: { d: 'dereference' },
-            boolean: ['tags', 'dereference', 'head'],
+            boolean: ['tags', 'heads', 'dereference', 'head'],
         });
-        if (!a.tags) {
-            throw new Error('memory-git: only `show-ref --tags` is supported');
-        }
-        const refs = await mg.showTagRefs();
+        const explicit = !!a.tags || !!a.heads;
+        const refs = await mg.showRefs({
+            // No explicit filter ⇒ everything (native git's default).
+            // Explicit ⇒ only what was asked for.
+            heads: explicit ? !!a.heads : true,
+            tags:  explicit ? !!a.tags  : true,
+            remotes: explicit ? false   : true,
+        });
         if (refs.length === 0) return '';
         const out: string[] = [];
         for (const r of refs) {
-            out.push(`${r.refOid} refs/tags/${r.tagName}`);
-            // `-d` adds the peeled `^{}` line, but only when the ref actually
-            // dereferences — i.e. annotated tags whose tag-object OID differs
-            // from the commit. Lightweight tags have refOid === commitOid;
-            // emitting `^{}` for them would diverge from git, which omits it.
-            if (a.dereference && r.refOid !== r.commitOid) {
-                out.push(`${r.commitOid} refs/tags/${r.tagName}^{}`);
+            out.push(`${r.oid} ${r.ref}`);
+            // `-d` adds the peeled `^{}` line, but ONLY when the ref
+            // dereferences — i.e. annotated tags (ref.peeled is set).
+            // Lightweight tags have no peeled and stay single-line, matching git.
+            if (a.dereference && r.peeled) {
+                out.push(`${r.peeled} ${r.ref}^{}`);
             }
         }
         return out.join('\n');
