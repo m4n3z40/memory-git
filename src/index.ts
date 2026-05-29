@@ -1215,7 +1215,10 @@ export class MemoryGit {
 
         try {
             const resolvedRef = await this._resolveAny(ref);
-            const commits = await git.log({ fs: this.fs, dir: this.dir, depth, ref: resolvedRef });
+            // Walk in git's topo+date order so log output matches `git log`
+            // in merge DAGs. iso-git's git.log does a depth-first per-parent
+            // walk that clumps side branches; native git interleaves by date.
+            const commits = await this._walkTopoDate([resolvedRef], { depth });
 
             const sinceMs = options.since instanceof Date ? options.since.getTime() :
                             typeof options.since === 'number' ? options.since : undefined;
@@ -2832,46 +2835,24 @@ export class MemoryGit {
                 }
                 if (options.maxCount != null) oids = oids.slice(0, options.maxCount);
             } else if (options?.all) {
-                const branches = await git.listBranches({ fs: this.fs, dir: this.dir });
-                const seen = new Set<string>();
-                // Note: ordering with all:true is per-branch, not topological
-                for (const branch of branches) {
-                    try {
-                        const commits = await git.log({
-                            fs: this.fs,
-                            dir: this.dir,
-                            ref: branch,
-                            depth: options.maxCount
-                        });
-                        for (const c of commits) {
-                            if (!seen.has(c.oid)) {
-                                seen.add(c.oid);
-                                oids.push(c.oid);
-                            }
-                        }
-                    } catch {
-                        // Skip branches without commits
-                    }
-                }
+                // Native `git rev-list --all` walks EVERY ref — branches,
+                // tags, remotes. Tag refs pointing at annotated tag objects
+                // dereference to the underlying commit; lightweight tags
+                // already point at a commit. showRefs surfaces both as
+                // `peeled` (when present) or `oid`.
+                const refs = await this.showRefs({ heads: true, tags: true, remotes: true });
+                const tipOids = refs.map(r => r.peeled ?? r.oid);
+                const walked = await this._walkTopoDate(tipOids, { depth: options.maxCount });
+                for (const w of walked) oids.push(w.oid);
             } else {
                 const ref = options?.ref ?? 'HEAD';
                 const resolvedRef = await this._resolveAny(ref);
-                const commits = await git.log({
-                    fs: this.fs,
-                    dir: this.dir,
-                    ref: resolvedRef,
-                    depth: options?.maxCount
-                });
-                // `git.log` yields the same commit again when reached via more
-                // than one path in a merge DAG (e.g. a commit that's an
-                // ancestor of both sides of a merge appears twice). Native
-                // `git rev-list` dedupes; match that so counts agree.
-                const seen = new Set<string>();
-                for (const c of commits) {
-                    if (seen.has(c.oid)) continue;
-                    seen.add(c.oid);
-                    oids.push(c.oid);
-                }
+                // Topo+date walk matches `git rev-list` order in merge DAGs;
+                // also dedupes (the walker's `seen` set), so the same commit
+                // reachable via two parents is emitted once, matching
+                // `git rev-list --count`.
+                const walked = await this._walkTopoDate([resolvedRef], { depth: options?.maxCount });
+                for (const w of walked) oids.push(w.oid);
             }
 
             if (options?.reverse) {
@@ -3984,6 +3965,84 @@ export class MemoryGit {
             author: { name: baseAuthor.name, email: baseAuthor.email, timestamp: aTs, timezoneOffset: aTz },
             committer: { name: baseCommitter.name, email: baseCommitter.email, timestamp: cTs, timezoneOffset: cTz },
         };
+    }
+
+    /**
+     * Walk commits from one or more start OIDs in git's default topo+date
+     * order — newest committer timestamp first, with topological constraint
+     * (commits are only emitted after all their descendants in the walk
+     * have been). On ties the first-parent / first-seeded item wins,
+     * matching native git's stable tiebreak.
+     *
+     * Replaces `git.log(...)` on hot paths where the iso-git output differs
+     * from `git log` / `git rev-list` in merge DAGs (iso-git does a
+     * depth-first walk that clumps side branches; git interleaves by date).
+     * Used by `log()`, `revList({ref})` single-ref, and `revList({all})`.
+     * Each commit is read at most once via `git.readCommit` — its full
+     * payload is returned so callers can drop straight into the existing
+     * CommitInfo / OID mapping.
+     *
+     * Range (A..B) intentionally still uses the boundary-set approach in
+     * `revList({range})` — that path needs the boundary anyway, and the
+     * ordering inside the result is dominated by the user's `to` walk.
+     * @private
+     */
+    private async _walkTopoDate(
+        startOids: string[],
+        opts: { depth?: number } = {},
+    ): Promise<Array<{ oid: string; commit: Awaited<ReturnType<typeof git.readCommit>>['commit'] }>> {
+        type QItem = { oid: string; ts: number; commit: Awaited<ReturnType<typeof git.readCommit>>['commit'] };
+        const queue: QItem[] = [];
+        const seen = new Set<string>();
+        const out: Array<{ oid: string; commit: QItem['commit'] }> = [];
+
+        // Sorted descending by ts; on equal ts we use `>=` so the new item
+        // lands AFTER all existing equal-ts items (FIFO tiebreak). That
+        // way the merge commit's parents — both stamped with the same
+        // GIT_COMMITTER_DATE — are popped in the order they were pushed,
+        // i.e. first-parent before second-parent, matching native git.
+        const enqueue = (item: QItem): void => {
+            let lo = 0;
+            let hi = queue.length;
+            while (lo < hi) {
+                const m = (lo + hi) >> 1;
+                if (queue[m].ts >= item.ts) lo = m + 1;
+                else hi = m;
+            }
+            queue.splice(lo, 0, item);
+        };
+
+        for (const oid of startOids) {
+            if (seen.has(oid)) continue;
+            seen.add(oid);
+            try {
+                const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid });
+                enqueue({ oid, ts: commit.committer.timestamp, commit });
+            } catch {
+                // Not a readable commit (e.g. a tag-object ref tip in --all)
+                // — drop from seen so a later ref that *does* point to a
+                // real commit can still enqueue.
+                seen.delete(oid);
+            }
+        }
+
+        while (queue.length > 0) {
+            if (opts.depth !== undefined && out.length >= opts.depth) break;
+            const { oid, commit } = queue.shift()!;
+            out.push({ oid, commit });
+            for (const p of commit.parent ?? []) {
+                if (seen.has(p)) continue;
+                seen.add(p);
+                try {
+                    const { commit: pc } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: p });
+                    enqueue({ oid: p, ts: pc.committer.timestamp, commit: pc });
+                } catch {
+                    // Unreadable parent — skip silently, matching git's
+                    // tolerance for partial histories.
+                }
+            }
+        }
+        return out;
     }
 
     /** True when HEAD points at a real commit; false on an unborn/missing HEAD. */
