@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { MemoryGit, NotAncestorError } from '../../src/index';
+import { MemoryGit } from '../../src/index';
 
 /**
  * Coverage for the new ancestry/range APIs:
@@ -60,15 +60,31 @@ describe("isAncestor / exec('merge-base --is-ancestor')", () => {
         await expect(mg.isAncestor('does-not-exist', 'HEAD')).rejects.toThrow();
     });
 
-    it("exec('merge-base --is-ancestor A B') returns empty on yes, throws NotAncestorError on no", async () => {
+    it("exec('merge-base --is-ancestor A B') returns empty on yes, throws Error with .exitCode=1 on no", async () => {
         const parent = await commit(mg, 'a.txt', '1', 'parent');
         const child = await commit(mg, 'a.txt', '2', 'child');
 
         const ok = await mg.exec(`merge-base --is-ancestor ${parent} ${child}`);
         expect(ok).toBe('');
 
+        // Mirrors the diff --quiet convention: a regular Error with exitCode
+        // tacked on. Shell strategies map .exitCode === 1 to native git's
+        // exit-1-empty-stderr without needing an instanceof on a typed class.
         await expect(mg.exec(`merge-base --is-ancestor ${child} ${parent}`))
-            .rejects.toBeInstanceOf(NotAncestorError);
+            .rejects.toMatchObject({ exitCode: 1 });
+    });
+
+    it('bad ref throws a regular Error without .exitCode (distinguishes "no" from "failure")', async () => {
+        await commit(mg, 'a.txt', '1', 'a');
+        // A shell strategy needs to tell these two apart:
+        //   exit 1 (not ancestor)         → .exitCode === 1
+        //   exit !=1 with stderr (failure) → .exitCode undefined
+        let err: unknown;
+        try {
+            await mg.exec('merge-base --is-ancestor deadbeefdeadbeefdeadbeefdeadbeefdeadbeef HEAD');
+        } catch (e) { err = e; }
+        expect(err).toBeInstanceOf(Error);
+        expect((err as Error & { exitCode?: number }).exitCode).toBeUndefined();
     });
 
     it("exec('merge-base A B') (without --is-ancestor) is rejected explicitly", async () => {
@@ -152,6 +168,29 @@ describe('rev-list range / --count', () => {
 
         const cli = (await mg.exec(`rev-list --max-count=2 ${root}..${c3}`)).split('\n');
         expect(cli).toEqual(limited);
+    });
+
+    it('dedupes commits reachable via two paths in a merge DAG (matches git rev-list)', async () => {
+        // root → main2 (main) ; root → s1 → s2 (side) ; merge(main2, s2) → m
+        // root is reachable from m via BOTH sides → git.log re-yields it,
+        // native git rev-list dedupes. revList / revListCount must too.
+        const root = await commit(mg, 'a.txt', '1', 'root');
+        await mg.exec('branch side');                       // side @ root
+        const main2 = await commit(mg, 'a.txt', '2', 'main2');
+        await mg.exec('checkout side');
+        const s1 = await commit(mg, 'b.txt', 'x', 's1');
+        const s2 = await commit(mg, 'b.txt', 'y', 's2');
+        await mg.exec('checkout main');
+        const mergeResult = await mg.merge('side');
+        const m = mergeResult.oid ?? (await mg.resolveRef('HEAD'));
+
+        const oids = await mg.revList({ ref: 'HEAD' });
+        // Five distinct commits — no repeats even though `root` and `main2`
+        // are reachable via two paths.
+        expect(new Set(oids).size).toBe(oids.length);
+        expect(new Set(oids)).toEqual(new Set([m, main2, s2, s1, root]));
+        expect(await mg.revListCount({ ref: 'HEAD' })).toBe(5);
+        expect(await mg.exec('rev-list --count HEAD')).toBe('5');
     });
 
     it('regression: single-ref rev-list, --all, --reverse, --max-count still work', async () => {

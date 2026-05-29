@@ -104,7 +104,7 @@ await mg.exec('git config user.name "Agent"');
 | `stash` | `push` (default), `pop`, `list` |
 | `rev-parse` | `<ref>`, `--short`, `--abbrev-ref` |
 | `rev-list` | `<ref>` or `<A>..<B>` (range: commits reachable from B not from A), `--all`, `--reverse`, `-n/--max-count <n>`, `--count` (print just the number) |
-| `merge-base` | `--is-ancestor <maybeAncestor> <descendant>` (only). Returns empty string on success; throws `NotAncestorError` on a negative answer so a shell strategy can map to exit 1 with empty stderr — `instanceof NotAncestorError` distinguishes that from a real failure |
+| `merge-base` | `--is-ancestor <maybeAncestor> <descendant>` (only). Returns empty string on yes; on no, throws an `Error` with `.exitCode = 1` (same shape as `diff --quiet`) so a shell strategy can map to native git's exit-1-empty-stderr without parsing message strings. Bad refs / IO failures throw without `.exitCode`, distinguishing "negative answer" from "real failure" |
 | `ls-files` | — |
 | `gc` | `--quiet`, `--aggressive` (no-op), `--prune=<date>` (always behaves as `--prune=now`) |
 
@@ -212,7 +212,7 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `deleteTag(name)` | `git tag -d` |
 | `describeExact(ref?, options?)` | `git describe --exact-match --tags`. `{skipPeel}` skips the per-loose-tag `readTag` peel for ~5× faster cold path on lightweight-only repos |
 | `tagsPointingAt(ref?, options?)` | `git tag --points-at`. `{limit, skipPeel}` |
-| `showTagRefs(options?)` | Resolves annotated tags to commit OIDs. `{limit, reverse, skipPeel}` — paginated listings short-circuit and only resolve the N tags requested instead of scanning every tag |
+| `showTagRefs(options?)` | Returns `{tagName, refOid, commitOid}` per tag. `refOid` is what the ref *itself* stores (tag-object OID for annotated, commit OID for lightweight — what `git show-ref` emits by default); `commitOid` is the peeled commit. `{limit, reverse, skipPeel}` — paginated listings short-circuit and only resolve the N tags requested instead of scanning every tag |
 | `packRefs()` | `git pack-refs --all`. Coalesces every loose `refs/{heads,tags,remotes}/*` into a single `.git/packed-refs` (annotated tags get peeled `^<commit>` lines inline). On a repo with thousands of loose tags this turns the cold path of any tag-iterating call from O(N) file reads into a single ~80 KB read. Call from `flush` (use `flush({clean:true})` so the loose files actually disappear from disk) or a periodic maintenance job — packing on every write rebuilds the whole file |
 
 ### Remotes

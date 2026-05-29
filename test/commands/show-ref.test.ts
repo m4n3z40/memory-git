@@ -16,7 +16,7 @@ describe('exec("show-ref")', () => {
         expect(out).toBe('');
     });
 
-    it('prints "<commitOid> refs/tags/<name>" for lightweight and annotated tags', async () => {
+    it('emits the ref-pointed OID per tag (tag-object for annotated, commit for lightweight)', async () => {
         await mg.writeFile('a.txt', '1');
         await mg.exec('add .');
         await mg.exec('commit -m init');
@@ -25,16 +25,35 @@ describe('exec("show-ref")', () => {
         await mg.exec('tag v-light');
         await mg.exec('tag -a v-anno -m "annotated release"');
 
-        const out = await mg.exec('show-ref --tags -d');
-        const lines = out.split('\n').sort();
+        // Public API exposes both OIDs: refOid (what `show-ref` emits) and
+        // commitOid (the peeled commit). Annotated → refOid is the tag
+        // object's own OID, distinct from the commit. Lightweight → they match.
+        const refs = await mg.showTagRefs();
+        const anno = refs.find(r => r.tagName === 'v-anno')!;
+        const light = refs.find(r => r.tagName === 'v-light')!;
+        expect(anno.commitOid).toBe(head);
+        expect(anno.refOid).not.toBe(head);
+        expect(anno.refOid).toMatch(/^[0-9a-f]{40}$/);
+        expect(light.refOid).toBe(head);
+        expect(light.commitOid).toBe(head);
 
-        // showTagRefs() dereferences annotated tags to their commit, and does not
-        // distinguish annotated vs lightweight — so only the single line per tag
-        // is emitted (no `^{}` peel suffix).
-        expect(lines).toEqual([
-            `${head} refs/tags/v-anno`,
+        // Default: one line per tag, refOid first column (matches `git show-ref --tags`).
+        const plain = (await mg.exec('show-ref --tags')).split('\n');
+        expect(new Set(plain)).toEqual(new Set([
+            `${anno.refOid} refs/tags/v-anno`,
             `${head} refs/tags/v-light`,
-        ]);
+        ]));
+
+        // `-d`: annotated gets an extra `^{}` line with the peeled commit
+        // (matches `git show-ref --tags -d`); lightweight stays single-line
+        // (no peel — refOid IS the commit).
+        const deref = await mg.exec('show-ref --tags -d');
+        const lines = deref.split('\n');
+        expect(lines).toContain(`${anno.refOid} refs/tags/v-anno`);
+        expect(lines).toContain(`${head} refs/tags/v-anno^{}`);
+        expect(lines).toContain(`${head} refs/tags/v-light`);
+        expect(lines).not.toContain(`${head} refs/tags/v-light^{}`);
+        expect(lines).toHaveLength(3); // 2 lines for annotated, 1 for lightweight
     });
 
     it('rejects show-ref without --tags', async () => {

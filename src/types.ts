@@ -392,7 +392,19 @@ export interface ResetOptions {
 
 export interface TagRef {
     tagName: string;
+    /**
+     * Peeled commit OID. For lightweight tags this equals `refOid`; for
+     * annotated tags it's the OID of the commit the tag *object* points at.
+     * What `tagsPointingAt`/`describeExact` match against.
+     */
     commitOid: string;
+    /**
+     * OID the ref itself stores — the tag-object OID for annotated tags,
+     * the commit OID for lightweight tags. What `git show-ref` emits by
+     * default (vs. `commitOid`, which it only emits under `-d`). Always
+     * populated.
+     */
+    refOid: string;
 }
 
 export interface ListTagsOptions {

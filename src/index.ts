@@ -30,9 +30,20 @@ import { primeSafeCompression } from './compression-fix.js';
 const EMPTY_TREE_OID = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
 export { primeSafeCompression, shouldForcePako } from './compression-fix.js';
-export { NotAncestorError } from './errors.js';
 
 type MemFs = ReturnType<typeof createFsFromVolume>;
+
+/**
+ * Internal tag-store entry. `refOid` is what the ref file/packed-refs line
+ * stores — a commit OID for lightweight tags, a tag-object OID for
+ * annotated. `peeledOid` is the commit OID the annotated tag points at, set
+ * only for annotated tags AND only when the loader didn't `skipPeel`.
+ * Callers wanting "the commit" go through `_commitOf`.
+ */
+interface TagOidEntry {
+    refOid: string;
+    peeledOid?: string;
+}
 
 // Public types live in ./types.ts. Re-exported for backwards-compatible
 // `import { ... } from 'memory-git'` usage.
@@ -420,6 +431,27 @@ export class MemoryGit {
      * strip them, resolve the base, then walk parents via `readCommit`.
      * @private
      */
+    /**
+     * Resolve `ref` to a commit OID, verifying the object actually exists in
+     * the store. `_resolveAny` short-circuits a 40-char hex through
+     * `expandOid` without checking existence — that's fine for callers that
+     * immediately feed the OID into another git op (which will then fail),
+     * but for new commands whose API contract is "throw on bad ref" (e.g.
+     * `isAncestor`, `revList({range})`) the verification has to happen up
+     * front, otherwise a bogus SHA produces a silently-wrong answer
+     * (`isAncestor → false`, `revList(range) → full history of to`).
+     * @private
+     */
+    private async _resolveCommit(ref: string): Promise<string> {
+        const oid = await this._resolveAny(ref);
+        try {
+            await git.readCommit({ fs: this.fs, dir: this.dir, oid });
+        } catch {
+            throw new Error(`bad revision '${ref}'`);
+        }
+        return oid;
+    }
+
     private async _resolveAny(ref: string): Promise<string> {
         const { base, ops } = this._parseRevSuffix(ref);
         if (!base) throw new Error(`fatal: bad revision '${ref}'`);
@@ -2000,15 +2032,15 @@ export class MemoryGit {
      * path. Avoid calling this in a hot loop — see `_loadAllTagOids`.
      */
     private async _resolveTagToCommit(tagName: string): Promise<TagRef> {
-        const oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: `refs/tags/${tagName}` });
-        let commitOid = oid;
+        const refOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: `refs/tags/${tagName}` });
+        let commitOid = refOid;
         try {
-            const obj = await git.readTag({ fs: this.fs, dir: this.dir, oid });
+            const obj = await git.readTag({ fs: this.fs, dir: this.dir, oid: refOid });
             commitOid = obj.tag.object;
         } catch {
-            // Lightweight tag — oid is already the commit
+            // Lightweight tag — refOid is already the commit
         }
-        return { tagName, commitOid };
+        return { tagName, refOid, commitOid };
     }
 
     /**
@@ -2023,11 +2055,22 @@ export class MemoryGit {
      * on a cold instance) share a single in-flight load instead of each
      * doing the full ~hundreds-of-tags I/O.
      */
-    private _tagOidsCache = new MemoizedAsync<Map<string, string>>();
+    private _tagOidsCache = new MemoizedAsync<Map<string, TagOidEntry>>();
 
     /** Drop the cached tag→commit map. Call after any write touching tags. */
     private _invalidateTagCache(): void {
         this._tagOidsCache.invalidate();
+    }
+
+    /**
+     * Commit OID a tag points at (peeled). For lightweight tags `refOid`
+     * IS the commit; for annotated tags it's the tag object's `tag.object`
+     * captured into `peeledOid`. When `peeledOid` is absent — annotated
+     * loose tag loaded under `skipPeel:true` — falls back to `refOid` (the
+     * tag-object OID), matching the documented `skipPeel` trade-off.
+     */
+    private _commitOf(entry: TagOidEntry): string {
+        return entry.peeledOid ?? entry.refOid;
     }
 
     /**
@@ -2136,13 +2179,13 @@ export class MemoryGit {
      * share the cache; pass the same value across all calls if precision
      * matters.
      */
-    private async _loadAllTagOids(opts: { skipPeel?: boolean } = {}): Promise<Map<string, string>> {
+    private async _loadAllTagOids(opts: { skipPeel?: boolean } = {}): Promise<Map<string, TagOidEntry>> {
         return this._tagOidsCache.get(() => this._doLoadAllTagOids(opts));
     }
 
     /** Underlying I/O for `_loadAllTagOids` (cache + dedup live in `_tagOidsCache`). */
-    private async _doLoadAllTagOids(opts: { skipPeel?: boolean }): Promise<Map<string, string>> {
-        const result = new Map<string, string>();
+    private async _doLoadAllTagOids(opts: { skipPeel?: boolean }): Promise<Map<string, TagOidEntry>> {
+        const result = new Map<string, TagOidEntry>();
         const gitDir = `${this.dir}/.git`;
 
         // --- Packed tags: one read of .git/packed-refs ---
@@ -2159,8 +2202,11 @@ export class MemoryGit {
                 }
                 if (line.startsWith('^')) {
                     // Peeled OID for the immediately preceding annotated tag line.
+                    // The refOid set on the previous iteration is preserved;
+                    // we only add the peeledOid alongside it.
                     if (pendingAnnotatedTag !== null) {
-                        result.set(pendingAnnotatedTag, line.slice(1));
+                        const existing = result.get(pendingAnnotatedTag);
+                        if (existing) existing.peeledOid = line.slice(1);
                     }
                     pendingAnnotatedTag = null;
                     continue;
@@ -2171,9 +2217,10 @@ export class MemoryGit {
                 const refName = line.slice(spaceIdx + 1);
                 if (!refName.startsWith('refs/tags/')) { pendingAnnotatedTag = null; continue; }
                 const tagName = refName.slice('refs/tags/'.length);
-                // Provisional: assume lightweight. A subsequent `^<oid>` line
-                // (annotated) will overwrite with the peeled commit OID.
-                result.set(tagName, oid);
+                // Provisional: store as lightweight (no peeled). A subsequent
+                // `^<oid>` line (annotated) attaches peeledOid alongside,
+                // keeping the original refOid intact for show-ref / -d.
+                result.set(tagName, { refOid: oid });
                 pendingAnnotatedTag = tagName;
             }
         } catch {
@@ -2199,22 +2246,22 @@ export class MemoryGit {
                             `${gitDir}/refs/tags/${tagName}`,
                             'utf8',
                         ) as string;
-                        const oid = raw.trim();
+                        const refOid = raw.trim();
                         // Lightweight: file content = commit OID. Annotated:
-                        // file content = tag object OID, needs peel via readTag.
-                        // skipPeel callers swallow the annotated case in
+                        // file content = tag object OID; readTag peels it.
+                        // skipPeel callers swallow the annotated peel in
                         // exchange for ~21× cold-path speedup (see method
-                        // docstring).
-                        let commitOid = oid;
+                        // docstring) — refOid still surfaces for show-ref.
+                        let peeledOid: string | undefined;
                         if (!skipPeel) {
                             try {
-                                const obj = await git.readTag({ fs: this.fs, dir: this.dir, oid });
-                                commitOid = obj.tag.object;
+                                const obj = await git.readTag({ fs: this.fs, dir: this.dir, oid: refOid });
+                                peeledOid = obj.tag.object;
                             } catch {
-                                // Lightweight tag — `oid` is already the commit.
+                                // Lightweight tag — refOid is already the commit, no peel needed.
                             }
                         }
-                        result.set(tagName, commitOid);
+                        result.set(tagName, peeledOid ? { refOid, peeledOid } : { refOid });
                     } catch {
                         // Skip broken/unreadable refs (matches git's silent-drop).
                     }
@@ -2302,8 +2349,8 @@ export class MemoryGit {
             // match first (the expected one for HEAD on a versioned repo).
             const entries = Array.from(tagOids.entries());
             for (let i = entries.length - 1; i >= 0 && matches.length < limit; i--) {
-                const [tagName, commitOid] = entries[i];
-                if (commitOid === oid) matches.push(tagName);
+                const [tagName, entry] = entries[i];
+                if (this._commitOf(entry) === oid) matches.push(tagName);
             }
 
             this._logOperation('tagsPointingAt', { ref, opts }, { success: true, count: matches.length, totalTags: tagOids.size });
@@ -2363,10 +2410,10 @@ export class MemoryGit {
             const ordered = opts.reverse ? names.reverse() : names;
             const limit = opts.limit != null ? Math.max(0, opts.limit) : ordered.length;
             const target = ordered.slice(0, limit);
-            const result: TagRef[] = target.map((tagName) => ({
-                tagName,
-                commitOid: tagOids.get(tagName)!,
-            }));
+            const result: TagRef[] = target.map((tagName) => {
+                const entry = tagOids.get(tagName)!;
+                return { tagName, refOid: entry.refOid, commitOid: this._commitOf(entry) };
+            });
 
             this._logOperation('showTagRefs', { ...opts }, { success: true, count: result.length });
             return result;
@@ -2498,16 +2545,22 @@ export class MemoryGit {
                 // A..B: commits reachable from `to` but not from `from`. Walk
                 // `from` to its roots to build the boundary set, then enumerate
                 // `to` via git.log (topo+date order, matches the single-ref
-                // path) and drop anything in the boundary.
-                const fromOid = await this._resolveAny(options.range.from);
-                const toOid = await this._resolveAny(options.range.to);
+                // path) and drop anything in the boundary. `git.log` can
+                // re-yield a commit reached via more than one path in a merge
+                // DAG (native git rev-list dedupes); we mirror that here so
+                // counts match `git rev-list --count`.
+                const fromOid = await this._resolveCommit(options.range.from);
+                const toOid = await this._resolveCommit(options.range.to);
                 if (fromOid === toOid) {
                     oids = [];
                 } else {
                     const exclude = await this._walkReachable(fromOid);
                     const commits = await git.log({ fs: this.fs, dir: this.dir, ref: toOid });
+                    const seen = new Set<string>();
                     for (const c of commits) {
-                        if (!exclude.has(c.oid)) oids.push(c.oid);
+                        if (exclude.has(c.oid) || seen.has(c.oid)) continue;
+                        seen.add(c.oid);
+                        oids.push(c.oid);
                     }
                 }
                 if (options.maxCount != null) oids = oids.slice(0, options.maxCount);
@@ -2542,7 +2595,16 @@ export class MemoryGit {
                     ref: resolvedRef,
                     depth: options?.maxCount
                 });
-                oids = commits.map(c => c.oid);
+                // `git.log` yields the same commit again when reached via more
+                // than one path in a merge DAG (e.g. a commit that's an
+                // ancestor of both sides of a merge appears twice). Native
+                // `git rev-list` dedupes; match that so counts agree.
+                const seen = new Set<string>();
+                for (const c of commits) {
+                    if (seen.has(c.oid)) continue;
+                    seen.add(c.oid);
+                    oids.push(c.oid);
+                }
             }
 
             if (options?.reverse) {
@@ -2576,8 +2638,8 @@ export class MemoryGit {
      */
     async isAncestor(maybeAncestor: string, descendant: string): Promise<boolean> {
         try {
-            const ancOid = await this._resolveAny(maybeAncestor);
-            const descOid = await this._resolveAny(descendant);
+            const ancOid = await this._resolveCommit(maybeAncestor);
+            const descOid = await this._resolveCommit(descendant);
             let isAnc = false;
             if (ancOid === descOid) {
                 isAnc = true;
