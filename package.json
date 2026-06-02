@@ -1,6 +1,6 @@
 {
   "name": "memory-git",
-  "version": "3.14.0",
+  "version": "3.14.1",
   "description": "In-memory Git for AI agents, slow filesystems (EFS/NFS), and test harnesses. Bash-like exec() dispatcher, no subprocess, isolated per-instance volumes, .gitignore-aware loading, explicit flush.",
   "main": "dist/index.js",
   "exports": {
@@ -71,17 +71,17 @@
     "diff": "^9.0.0",
     "ignore": "^7.0.5",
     "isomorphic-git": "^1.38.3",
-    "memfs": "^4.57.2",
+    "memfs": "^4.57.3",
     "mri": "^1.2.0",
     "shell-quote": "^1.8.4"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
     "@types/shell-quote": "^1.7.5",
-    "@vitest/coverage-v8": "^4.1.7",
+    "@vitest/coverage-v8": "^4.1.8",
     "just-bash": "^3.0.1",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.7"
+    "vitest": "^4.1.8"
   },
   "peerDependencies": {
     "just-bash": ">=3.0.0"

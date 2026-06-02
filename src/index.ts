@@ -23,7 +23,7 @@ import {
     type FileFingerprint,
 } from './disk-sync.js';
 import { LazyState, wrapLazyFs } from './lazy-fs.js';
-import { wrapRecordingFs } from './recording-fs.js';
+import { wrapRecordingFs, type MutationKind } from './recording-fs.js';
 import { getCommand, type Command } from './commands/index.js';
 import { primeSafeCompression } from './compression-fix.js';
 
@@ -438,6 +438,18 @@ export class MemoryGit {
      * Cleared by any load/flush/clear that does build or invalidate a snapshot.
      */
     private _snapshotSkippedAtLoad: boolean = false;
+    /**
+     * Working-tree paths deleted in memory but not yet pruned from disk. Any
+     * delete that flows through the recording fs — `deleteFile`, the source side
+     * of `rename`, a build deleting through `toJustBashFs`, or a checkout/reset
+     * that removes a worktree file — records a tombstone here; a later write to
+     * the same path clears it (write-after-delete). `flush()` unlinks each
+     * tombstoned path on disk *unconditionally* (like real git), not gated
+     * behind `{clean}`, so a deletion can't resurrect after flush+loadFromDisk.
+     * `.git/` internals are excluded: object/pack pruning (e.g. after `gc()`)
+     * still requires `{clean:true}`, which reconciles the full snapshot.
+     */
+    private _tombstones: Set<string> = new Set();
 
     /**
      * Read-only flag. False on regular instances; locked to `true` on the
@@ -501,7 +513,7 @@ export class MemoryGit {
         // commit/tag/merge. Lazy materialization writes the inner volume
         // directly, bypassing this wrapper, so faulting a file in from disk is
         // correctly not counted as a mutation.
-        this.fs = wrapRecordingFs(baseFs, (memPath) => this._recordUnpersisted(memPath));
+        this.fs = wrapRecordingFs(baseFs, (memPath, kind) => this._recordUnpersisted(memPath, kind));
     }
 
     /**
@@ -541,7 +553,7 @@ export class MemoryGit {
             'name', 'fs', 'vol', 'dir',
             'realDir', 'isInitialized', 'author',
             '_log', '_stash', '_dirtyFiles', '_unpersisted', '_diskSnapshot', '_snapshotPath',
-            '_tracksDiskSnapshot', '_snapshotSkippedAtLoad',
+            '_tracksDiskSnapshot', '_snapshotSkippedAtLoad', '_tombstones',
             // Per-instance read caches: the view shares the parent's volume and
             // state, so it must share the cache instances too — otherwise a
             // parent-side write that invalidates a cache wouldn't be seen here.
@@ -956,9 +968,11 @@ export class MemoryGit {
             // Just hydrated from disk: memory mirrors disk, nothing is pending.
             // The eager copy writes through this.fs (the recorder, which also
             // feeds _dirtyFiles), so reset both dirty views. Lazy load doesn't
-            // eager-write, so these are already empty.
+            // eager-write, so these are already empty. Pending deletions are
+            // likewise moot — disk is now the source of truth.
             this._unpersisted.clear();
             this._dirtyFiles.clear();
+            this._tombstones.clear();
 
             // Seed the add('.') fast-path only when add('.') would otherwise
             // miss files it must stage:
@@ -3122,6 +3136,11 @@ export class MemoryGit {
             // success, so any write that lands *during* the async flush stays
             // marked dirty (it may not have been on disk when we walked).
             const persistedThisFlush = [...this._unpersisted];
+            // Same snapshot-then-clear discipline for working-tree deletions:
+            // capture the pending tombstones up front and clear exactly these on
+            // success, so a delete that lands *during* the async flush survives
+            // to the next flush.
+            const deletionsThisFlush = [...this._tombstones];
             const destination = targetPath ? pathNode.resolve(targetPath) : this.realDir;
             if (!destination) {
                 throw new Error('No destination path specified and repository was not loaded from disk');
@@ -3130,6 +3149,33 @@ export class MemoryGit {
             if (!(await realPathExists(destination))) {
                 await fsRealAsync.mkdir(destination, { recursive: true });
             }
+
+            // Prune tombstoned working-tree paths from disk. Unconditional (like
+            // real git: the on-disk worktree mirrors the volume) — not gated
+            // behind `{clean}`, which is reserved for the heavier full-snapshot
+            // reconciliation (e.g. gc'd `.git/` objects). The unlink is
+            // idempotent: an already-absent path is fine. Returns the count
+            // removed so callers/logs can report it.
+            const pruneDeletions = async (): Promise<number> => {
+                let n = 0;
+                for (const rel of deletionsThisFlush) {
+                    const fullPath = pathNode.join(destination, rel);
+                    try {
+                        await fsRealAsync.unlink(fullPath);
+                        n += 1;
+                    } catch {
+                        // Already gone or unreadable — the intent (path must not
+                        // exist on disk) is satisfied either way.
+                    }
+                    this._diskSnapshot.delete(rel);
+                    // Lazy mode records its own tombstone for the same path; drop
+                    // it so the lazy sweep below doesn't unlink (and re-count) it.
+                    if (this._lazy) {
+                        this._lazyState.tombstones.delete(pathNode.posix.join(this.dir, rel));
+                    }
+                }
+                return n;
+            };
 
             const clean = options.clean === true;
             // Incremental is opt-out as of 3.4. `{force:true}` forces a full
@@ -3166,6 +3212,9 @@ export class MemoryGit {
                 // covers only files the user actually touched in memory.
                 const flushFs = this._lazy ? this._rawFs : this.fs;
                 const fileCount = await copyMemoryToDisk(flushFs, this.dir, destination);
+                // copyMemoryToDisk only writes; deletions must still be pruned,
+                // or a full/forced flush would leave deleted files on disk.
+                const removed = await pruneDeletions();
                 // A full flush bypasses the snapshot; subsequent incremental flushes
                 // would have a stale baseline, so invalidate it.
                 this._diskSnapshot.clear();
@@ -3176,7 +3225,9 @@ export class MemoryGit {
                     filesFlushed: fileCount,
                     fullRewrite: true,
                     fallbackToFull,
+                    removed,
                 });
+                for (const p of deletionsThisFlush) this._tombstones.delete(p);
                 for (const p of persistedThisFlush) this._unpersisted.delete(p);
                 return fileCount;
             }
@@ -3196,7 +3247,13 @@ export class MemoryGit {
                 flushFs, this.dir, destination, '', this._diskSnapshot, seen,
             );
 
-            let removed = 0;
+            // Explicit working-tree deletions are pruned every flush, so a
+            // deleted file can't survive on disk and resurrect on the next
+            // loadFromDisk.
+            let removed = await pruneDeletions();
+            // `{clean}` additionally reconciles the *full* snapshot against what
+            // the memfs walk saw — catching deletions that never went through a
+            // tombstone (e.g. `.git/` objects dropped by gc).
             if (clean) {
                 for (const path of [...this._diskSnapshot.keys()]) {
                     if (seen.has(path)) continue;
@@ -3241,6 +3298,7 @@ export class MemoryGit {
                 skipped,
                 removed,
             });
+            for (const p of deletionsThisFlush) this._tombstones.delete(p);
             for (const p of persistedThisFlush) this._unpersisted.delete(p);
             return written;
         } catch (error) {
@@ -3995,6 +4053,7 @@ export class MemoryGit {
             this._stash = [];
             this._dirtyFiles.clear();
             this._unpersisted.clear();
+            this._tombstones.clear();
             this._diskSnapshot.clear();
             this._snapshotPath = null;
             this._snapshotSkippedAtLoad = false;
@@ -4040,7 +4099,7 @@ export class MemoryGit {
      * repo-relative (matching the disk snapshot), e.g. `.git/refs/tags/v1`.
      * @private
      */
-    private _recordUnpersisted(memPath: string): void {
+    private _recordUnpersisted(memPath: string, kind: MutationKind = 'write'): void {
         const underDir = memPath.startsWith(this.dir + '/');
         const rel = underDir ? memPath.slice(this.dir.length + 1) : memPath;
         this._unpersisted.add(rel);
@@ -4051,6 +4110,12 @@ export class MemoryGit {
         // internals (objects/refs/index/HEAD) are never staged, so skip them.
         if (underDir && rel.length > 0 && rel !== '.git' && !rel.startsWith('.git/')) {
             this._dirtyFiles.add(rel);
+            // Track working-tree deletions so the next flush prunes them from
+            // disk by default. A re-write of the same path cancels the pending
+            // prune (the file exists again). `.git/` paths are excluded above,
+            // so gc/object deletions stay behind the `{clean}` reconciliation.
+            if (kind === 'delete') this._tombstones.add(rel);
+            else this._tombstones.delete(rel);
         }
     }
 

@@ -22,68 +22,81 @@ import { normalize } from './fs-path.js';
 type MemFs = ReturnType<typeof createFsFromVolume>;
 
 /**
- * Wrap `memfs` so writes/deletes/renames/symlinks invoke `onMutate(memPath)`
+ * The kind of mutation a path underwent. `delete` covers unlink and the source
+ * side of a rename; `write` covers writeFile, symlink, and the destination side
+ * of a rename. The consumer uses this to distinguish a path that should be
+ * pruned from disk (delete) from one that should be persisted (write), and so a
+ * write-after-delete on the same path cancels a pending prune.
+ */
+export type MutationKind = 'write' | 'delete';
+
+/**
+ * Wrap `memfs` so writes/deletes/renames/symlinks invoke `onMutate(memPath, kind)`
  * (normalized) before being applied. The returned object exposes the exact
  * same surface (sync, callback-async, and `.promises`) as the input.
  */
-export function wrapRecordingFs(memfs: MemFs, onMutate: (memPath: string) => void): MemFs {
-    const mark = (p: unknown): void => onMutate(normalize(p as string | Buffer | URL));
+export function wrapRecordingFs(
+    memfs: MemFs,
+    onMutate: (memPath: string, kind: MutationKind) => void,
+): MemFs {
+    const mark = (p: unknown, kind: MutationKind): void =>
+        onMutate(normalize(p as string | Buffer | URL), kind);
 
     // ---------- sync ----------
     const writeFileSync = (p: any, data: any, opts?: any): void => {
-        mark(p);
+        mark(p, 'write');
         return memfs.writeFileSync(p, data, opts);
     };
     const unlinkSync = (p: any): void => {
-        mark(p);
+        mark(p, 'delete');
         return memfs.unlinkSync(p);
     };
     const renameSync = (from: any, to: any): void => {
-        mark(from);
-        mark(to);
+        mark(from, 'delete');
+        mark(to, 'write');
         return memfs.renameSync(from, to);
     };
     const symlinkSync = (target: any, p: any, type?: any): void => {
-        mark(p);
+        mark(p, 'write');
         return memfs.symlinkSync(target, p, type);
     };
 
     // ---------- callback-async ----------
     const writeFile = (p: any, ...rest: any[]): void => {
-        mark(p);
+        mark(p, 'write');
         return (memfs as any).writeFile(p, ...rest);
     };
     const unlink = (p: any, cb: any): void => {
-        mark(p);
+        mark(p, 'delete');
         return (memfs as any).unlink(p, cb);
     };
     const rename = (from: any, to: any, cb: any): void => {
-        mark(from);
-        mark(to);
+        mark(from, 'delete');
+        mark(to, 'write');
         return (memfs as any).rename(from, to, cb);
     };
     const symlink = (target: any, p: any, ...rest: any[]): void => {
-        mark(p);
+        mark(p, 'write');
         return (memfs as any).symlink(target, p, ...rest);
     };
 
     // ---------- promises ----------
     const promises = {
         writeFile: async (p: any, data: any, opts?: any) => {
-            mark(p);
+            mark(p, 'write');
             return (memfs.promises as any).writeFile(p, data, opts);
         },
         unlink: async (p: any) => {
-            mark(p);
+            mark(p, 'delete');
             return (memfs.promises as any).unlink(p);
         },
         rename: async (from: any, to: any) => {
-            mark(from);
-            mark(to);
+            mark(from, 'delete');
+            mark(to, 'write');
             return (memfs.promises as any).rename(from, to);
         },
         symlink: async (target: any, p: any, type?: any) => {
-            mark(p);
+            mark(p, 'write');
             return (memfs.promises as any).symlink(target, p, type);
         },
     };

@@ -1098,14 +1098,17 @@ describe('MemoryGit', () => {
             expect(await fs.access(path.join(dstDir, 'src/a.js')).then(() => true, () => false)).toBe(true);
         });
 
-        it('clean:false (default) leaves orphans on disk', async () => {
+        it('default flush prunes explicitly deleted files from disk (no clean needed)', async () => {
             await memGit.loadFromDisk(srcDir, { incremental: true });
             await memGit.flush(dstDir, { incremental: true });
 
             await memGit.deleteFile('src/b.js');
+            // No {clean} — a deleteFile is an explicit "this must not exist",
+            // so the worktree on disk must mirror the volume and drop it.
             await memGit.flush(dstDir, { incremental: true });
 
-            expect(await fs.access(path.join(dstDir, 'src/b.js')).then(() => true, () => false)).toBe(true);
+            expect(await fs.access(path.join(dstDir, 'src/b.js')).then(() => true, () => false)).toBe(false);
+            expect(await fs.access(path.join(dstDir, 'src/a.js')).then(() => true, () => false)).toBe(true);
         });
 
         it('switching destination invalidates the snapshot', async () => {
@@ -1124,6 +1127,134 @@ describe('MemoryGit', () => {
                 expect(await fs.readFile(path.join(altDst, 'README.md'), 'utf8')).toBe('# v1');
             } finally {
                 await fs.rm(altDst, { recursive: true, force: true });
+            }
+        });
+    });
+
+    describe('flush() prunes deletions from disk', () => {
+        const dstDir = '/tmp/memory-git-prune-dst';
+
+        beforeEach(async () => {
+            await fs.rm(dstDir, { recursive: true, force: true });
+            await fs.mkdir(dstDir, { recursive: true });
+            await memGit.init();
+        });
+
+        afterEach(async () => {
+            await fs.rm(dstDir, { recursive: true, force: true });
+        });
+
+        const onDisk = (rel: string) =>
+            fs.access(path.join(dstDir, rel)).then(() => true, () => false);
+
+        it('writeFile then flush leaves the file on disk', async () => {
+            await memGit.writeFile('a.txt', 'hello');
+            await memGit.flush(dstDir);
+            expect(await onDisk('a.txt')).toBe(true);
+        });
+
+        it('deleteFile then flush removes the file from disk (no clean flag)', async () => {
+            await memGit.writeFile('a.txt', 'hello');
+            await memGit.flush(dstDir);
+            expect(await onDisk('a.txt')).toBe(true);
+
+            await memGit.deleteFile('a.txt');
+            await memGit.flush(dstDir);
+            expect(await onDisk('a.txt')).toBe(false);
+        });
+
+        it('a deleted file does not resurrect after flush + loadFromDisk', async () => {
+            await memGit.writeFile('a.txt', 'hello');
+            await memGit.flush(dstDir);
+
+            await memGit.deleteFile('a.txt');
+            // This is the downstream exec pattern: pre:flush + post:loadFromDisk.
+            await memGit.flush(dstDir);
+            await memGit.loadFromDisk(dstDir);
+
+            expect(await memGit.fileExists('a.txt')).toBe(false);
+            expect(await onDisk('a.txt')).toBe(false);
+        });
+
+        it('prune is idempotent — ENOENT tolerated when the disk file is already gone', async () => {
+            await memGit.writeFile('a.txt', 'hello');
+            await memGit.flush(dstDir);
+
+            await memGit.deleteFile('a.txt');
+            // Remove it out-of-band so the flush unlink hits ENOENT.
+            await fs.rm(path.join(dstDir, 'a.txt'));
+
+            await expect(memGit.flush(dstDir)).resolves.toBeDefined();
+            expect(await onDisk('a.txt')).toBe(false);
+        });
+
+        it('write-after-delete cancels the pending prune', async () => {
+            await memGit.writeFile('a.txt', 'v1');
+            await memGit.flush(dstDir);
+
+            await memGit.deleteFile('a.txt');
+            await memGit.writeFile('a.txt', 'v2'); // re-created before flush
+            await memGit.flush(dstDir);
+
+            expect(await onDisk('a.txt')).toBe(true);
+            expect(await fs.readFile(path.join(dstDir, 'a.txt'), 'utf8')).toBe('v2');
+        });
+
+        it('rename prunes the old path and writes the new one', async () => {
+            await memGit.writeFile('old.txt', 'data');
+            await memGit.flush(dstDir);
+
+            await memGit.rename('old.txt', 'new.txt');
+            await memGit.flush(dstDir);
+
+            expect(await onDisk('old.txt')).toBe(false);
+            expect(await onDisk('new.txt')).toBe(true);
+        });
+
+        it('forced full rewrite also prunes deletions', async () => {
+            await memGit.writeFile('a.txt', 'hello');
+            await memGit.writeFile('b.txt', 'world');
+            await memGit.flush(dstDir, { force: true });
+            expect(await onDisk('a.txt')).toBe(true);
+            expect(await onDisk('b.txt')).toBe(true);
+
+            await memGit.deleteFile('b.txt');
+            await memGit.flush(dstDir, { force: true });
+
+            expect(await onDisk('a.txt')).toBe(true);
+            expect(await onDisk('b.txt')).toBe(false);
+        });
+
+        it('non-snapshot instance (tracksDiskSnapshot:false) still prunes deletions', async () => {
+            const mg = new MemoryGit('no-snapshot', { tracksDiskSnapshot: false });
+            await mg.init();
+            await mg.writeFile('a.txt', 'hello');
+            await mg.flush(dstDir);
+            expect(await onDisk('a.txt')).toBe(true);
+
+            await mg.deleteFile('a.txt');
+            await mg.flush(dstDir);
+            expect(await onDisk('a.txt')).toBe(false);
+        });
+
+        it('lazy-mode delete is pruned on a plain flush back to source', async () => {
+            const lazySrc = '/tmp/memory-git-prune-lazy-src';
+            await fs.rm(lazySrc, { recursive: true, force: true });
+            await fs.mkdir(lazySrc, { recursive: true });
+            await fs.writeFile(path.join(lazySrc, 'a.txt'), 'hello');
+            await fs.writeFile(path.join(lazySrc, 'b.txt'), 'world');
+            const exists = (rel: string) =>
+                fs.access(path.join(lazySrc, rel)).then(() => true, () => false);
+            try {
+                const mg = new MemoryGit('lazy-prune', { lazy: true });
+                await mg.loadFromDisk(lazySrc);
+                await mg.deleteFile('b.txt'); // never materialized → lazy tombstone
+                await mg.flush(); // back to the source dir
+
+                expect(await exists('a.txt')).toBe(true);
+                expect(await exists('b.txt')).toBe(false);
+            } finally {
+                await fs.rm(lazySrc, { recursive: true, force: true });
             }
         });
     });
