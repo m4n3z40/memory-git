@@ -452,6 +452,15 @@ export class MemoryGit {
     private _tombstones: Set<string> = new Set();
 
     /**
+     * Armed by `loadFromDisk`: the loaded worktree may have tracked files that
+     * are absent on disk (pending deletions) which the dirty-set seed can't see.
+     * The next `add({all|update})`/`add('.')` runs a one-shot index scan to fold
+     * those deletions into `_dirtyFiles`, then disarms. Deferred (not done in
+     * loadFromDisk) so lazy loads don't fault `.git/index` in prematurely.
+     */
+    private _pendingDeletionScan = false;
+
+    /**
      * Read-only flag. False on regular instances; locked to `true` on the
      * sibling returned by `readOnlyView()`.
      */
@@ -996,6 +1005,18 @@ export class MemoryGit {
                 }
             }
 
+            // A loaded worktree can diverge from its index: a tracked file may
+            // be absent from disk (deleted in memory then flushed, or removed
+            // out-of-band before this load). The seed loops above only enumerate
+            // files that *exist* on disk, so such a deletion would be invisible
+            // to the add('.')/-A fast-path and could never be staged via `add` —
+            // only via explicit remove()/`git rm` — while `status` still reports
+            // it as "D", leaving add/commit disagreeing. We can't reconcile here
+            // without reading `.git/index`, which would fault bytes in and defeat
+            // lazy loading; instead arm a one-shot scan that the next bulk add
+            // runs, by which point the index is being touched anyway.
+            this._pendingDeletionScan = true;
+
             this.isInitialized = true;
             return fileCount;
         } catch (error) {
@@ -1119,11 +1140,33 @@ export class MemoryGit {
     async add(filepath: string | string[] = [], options: AddOptions = {}): Promise<boolean> {
         this._assertWritable('add');
         try {
-            const wantsAll = options.all || filepath === '.' || filepath === '-A';
+            // Recognise the "stage everything" pathspec in both the string form
+            // (`add('.')`) and the array form the exec dispatcher produces
+            // (`add(['.'])` for `git add .`). Without the array check, `git add .`
+            // would hit the literal-path branch below and call `git.add(['.'])`,
+            // which stages existing files but silently ignores working-tree
+            // deletions — unlike real git and unlike `add -A`/`add('.')`.
+            const list = Array.isArray(filepath) ? filepath : [filepath];
+            const wantsAll = options.all || list.includes('.') || list.includes('-A');
             const wantsUpdate = options.update;
             let files: string[];
 
             if (wantsAll || wantsUpdate) {
+                // One-shot reconcile after loadFromDisk: fold any tracked-but-
+                // missing files (pending deletions the seed couldn't enumerate)
+                // into the dirty set before we read it. Touching the index here
+                // is fine — a bulk add operates on it regardless.
+                if (this._pendingDeletionScan) {
+                    this._pendingDeletionScan = false;
+                    try {
+                        for (const f of await git.listFiles({ fs: this.fs, dir: this.dir })) {
+                            const full = pathNode.posix.join(this.dir, f);
+                            if (!this.fs.existsSync(full)) this._dirtyFiles.add(f);
+                        }
+                    } catch {
+                        // No index yet (unborn HEAD) — nothing tracked to reconcile.
+                    }
+                }
                 // Fast path: process only files we've touched since the last sync.
                 // We track these in `_dirtyFiles` (populated by writeFile/deleteFile/rename
                 // /stashPop/loadFromDisk) so we don't have to rescan the whole workdir.
@@ -1141,7 +1184,7 @@ export class MemoryGit {
                     files = [...this._dirtyFiles];
                 }
             } else {
-                files = Array.isArray(filepath) ? filepath : [filepath];
+                files = list;
             }
 
             // Split into present (to add) and missing (to remove from index)
