@@ -284,6 +284,7 @@ import type {
     AddOptions,
     CommitOptions,
     RemoveOptions,
+    LsFilesOptions,
     DeleteBranchOptions,
     CheckoutOptions,
     MergeOptions,
@@ -332,6 +333,7 @@ export type {
     AddOptions,
     CommitOptions,
     RemoveOptions,
+    LsFilesOptions,
     DeleteBranchOptions,
     CheckoutOptions,
     MergeOptions,
@@ -371,11 +373,24 @@ interface StashedFile {
 }
 
 /**
+ * Does `file` match a `git`-style pathspec? A pathspec matches when it equals
+ * the file path exactly or names a leading directory of it (`dist` →
+ * `dist/x.js`). Empty/`.` matches everything. Glob/wildcard syntax is not
+ * supported — pathspecs are treated as literal paths/prefixes.
+ */
+function matchesPathspec(file: string, spec: string): boolean {
+    const s = spec.replace(/\/+$/, '');
+    if (s === '' || s === '.') return true;
+    if (file === s) return true;
+    return file.startsWith(s + '/');
+}
+
+/**
  * MemoryGit - In-memory Git implementation
- * 
+ *
  * Loads the project into memory, executes all git operations in memory,
  * and syncs to disk only when flush() is called.
- * 
+ *
  * All real disk operations use async versions to not block the Node.js event loop.
  */
 export class MemoryGit {
@@ -1223,23 +1238,51 @@ export class MemoryGit {
      * @param filepath - Relative file path
      * @param options - {cached: true} removes only from index, keeping the working file (git rm --cached)
      */
-    async remove(filepath: string, options: RemoveOptions = {}): Promise<boolean> {
+    async remove(
+        filepath: string | string[],
+        options: RemoveOptions = {},
+    ): Promise<string[]> {
         this._assertWritable('remove');
+        const pathspecs = (Array.isArray(filepath) ? filepath : [filepath]).map(String);
         try {
-            await git.remove({ fs: this.fs, dir: this.dir, filepath });
+            // Resolve pathspecs against the index. A pathspec may name a single
+            // tracked file or (with -r) a directory whose entries are all removed.
+            const indexed = await git.listFiles({ fs: this.fs, dir: this.dir });
+            const indexedSet = new Set(indexed);
+            const toRemove = new Set<string>();
 
-            if (!options.cached) {
-                const fullPath = pathNode.posix.join(this.dir, filepath);
-                if (this.fs.existsSync(fullPath)) {
-                    this.fs.unlinkSync(fullPath);
+            for (const spec of pathspecs) {
+                if (indexedSet.has(spec)) {
+                    toRemove.add(spec);
+                    continue;
+                }
+                // Directory pathspec: matches every index entry under `spec/`.
+                const prefix = spec.replace(/\/+$/, '') + '/';
+                const under = indexed.filter(f => f.startsWith(prefix));
+                if (under.length > 0) {
+                    if (!options.recursive) {
+                        throw new Error(`fatal: not removing '${spec}' recursively without -r`);
+                    }
+                    for (const f of under) toRemove.add(f);
+                } else if (!options.ignoreUnmatch) {
+                    throw new Error(`fatal: pathspec '${spec}' did not match any files`);
                 }
             }
-            this._dirtyFiles.delete(filepath);
 
-            this._logOperation('remove', { filepath, options }, { success: true });
-            return true;
+            const removed = [...toRemove].sort();
+            for (const f of removed) {
+                await git.remove({ fs: this.fs, dir: this.dir, filepath: f });
+                if (!options.cached) {
+                    const fullPath = pathNode.posix.join(this.dir, f);
+                    if (this.fs.existsSync(fullPath)) this.fs.unlinkSync(fullPath);
+                }
+                this._dirtyFiles.delete(f);
+            }
+
+            this._logOperation('remove', { filepath: pathspecs, options }, { success: true, removed });
+            return removed;
         } catch (error) {
-            this._logOperation('remove', { filepath, options }, null, error as Error);
+            this._logOperation('remove', { filepath: pathspecs, options }, null, error as Error);
             throw error;
         }
     }
@@ -2898,6 +2941,62 @@ export class MemoryGit {
             return files;
         } catch (error) {
             this._logOperation('listTrackedFiles', { ref }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Lists files the way `git ls-files` does — from the **index** (staging
+     * area), not from HEAD. This is the key difference from
+     * {@link listTrackedFiles}, which reads a commit tree: after
+     * `rm --cached foo`, `lsFiles()` stops listing `foo` immediately while
+     * `listTrackedFiles()` still shows it until the next commit.
+     *
+     * Supports pathspec filtering and the common selectors `-c/-o/-m/-d`.
+     * Ignored files are always excluded (see {@link LsFilesOptions.others}).
+     * @returns Sorted list of matching paths.
+     */
+    async lsFiles(options: LsFilesOptions = {}): Promise<string[]> {
+        try {
+            const pathspecs = options.pathspecs ?? [];
+            const anySelector =
+                options.cached || options.others || options.modified || options.deleted;
+            // Default (no selector) == --cached, matching git.
+            const cached = anySelector ? !!options.cached : true;
+
+            const result = new Set<string>();
+
+            if (cached) {
+                for (const f of await git.listFiles({ fs: this.fs, dir: this.dir })) {
+                    result.add(f);
+                }
+            }
+
+            if (options.others || options.modified || options.deleted) {
+                const matrix = await this._statusMatrix();
+                for (const [fp, head, workdir, stage] of matrix) {
+                    const f = fp as string;
+                    const h = head as number, w = workdir as number, s = stage as number;
+                    // Deleted from the working tree but still in the index.
+                    if (options.deleted && s !== 0 && w === 0) result.add(f);
+                    // Working-tree content differs from the index (incl. deletion).
+                    if (options.modified && s !== 0 && (w === 0 || s === 3 || (s === 1 && w === 2))) {
+                        result.add(f);
+                    }
+                    // Untracked (statusMatrix already drops ignored files).
+                    if (options.others && h === 0 && s === 0 && w === 2) result.add(f);
+                }
+            }
+
+            let files = [...result].sort();
+            if (pathspecs.length > 0) {
+                files = files.filter(f => pathspecs.some(ps => matchesPathspec(f, ps)));
+            }
+
+            this._logOperation('lsFiles', { options }, { success: true, count: files.length });
+            return files;
+        } catch (error) {
+            this._logOperation('lsFiles', { options }, null, error as Error);
             throw error;
         }
     }

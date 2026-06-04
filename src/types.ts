@@ -256,6 +256,33 @@ export interface CommitOptions {
 export interface RemoveOptions {
     /** Remove only from index, keep working file (git rm --cached) */
     cached?: boolean;
+    /** Recurse into directories — required to remove a tracked dir (git rm -r) */
+    recursive?: boolean;
+    /** Exit successfully when a pathspec matches nothing (git rm --ignore-unmatch) */
+    ignoreUnmatch?: boolean;
+}
+
+export interface LsFilesOptions {
+    /**
+     * Limit output to files matching these pathspecs. A pathspec matches a file
+     * by exact path or as a leading directory (e.g. `dist` matches `dist/x.js`).
+     * Empty/`.` matches everything. Glob/wildcard pathspecs are not supported.
+     */
+    pathspecs?: string[];
+    /** List files in the index — the default when no other selector is given (git ls-files -c). */
+    cached?: boolean;
+    /**
+     * List untracked files (git ls-files -o). Ignored files are always excluded,
+     * i.e. this behaves as if `--exclude-standard` were always set; the
+     * {@link excludeStandard} flag is therefore accepted but a no-op.
+     */
+    others?: boolean;
+    /** List files with unstaged modifications, including unstaged deletions (git ls-files -m). */
+    modified?: boolean;
+    /** List files deleted from the working tree but still in the index (git ls-files -d). */
+    deleted?: boolean;
+    /** Accepted for CLI compatibility; ignored files are always excluded regardless. */
+    excludeStandard?: boolean;
 }
 
 export interface DeleteBranchOptions {
