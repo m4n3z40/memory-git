@@ -106,6 +106,7 @@ await mg.exec('git config user.name "Agent"');
 | `rev-list` | `<ref>` or `<A>..<B>` (range: commits reachable from B not from A), `--all`, `--reverse`, `-n/--max-count <n>`, `--count` (print just the number) |
 | `merge-base` | `--is-ancestor <maybeAncestor> <descendant>` (only). Returns empty string on yes; on no, throws an `Error` with `.exitCode = 1` (same shape as `diff --quiet`) so a shell strategy can map to native git's exit-1-empty-stderr without parsing message strings. Bad refs / IO failures throw without `.exitCode`, distinguishing "negative answer" from "real failure" |
 | `ls-files` | — |
+| `ls-tree` | `[-r] [-t] [--name-only] [<tree-ish>] [<path>...]`. Reads commit/tree **objects**, never the index — immune to a stale `.git/index`. `<tree-ish>` accepts `HEAD`, branch/tag, commit SHA, or tree SHA (commits/tags peeled automatically). Throws on an unborn HEAD or bad ref |
 | `gc` | `--quiet`, `--aggressive` (no-op), `--prune=<date>` (always behaves as `--prune=now`) |
 
 Unsupported subcommands (`rebase`, `cherry-pick`, `bisect`, `reflog`, `submodule`, `worktree`, `blame`) throw a clear error rather than silently misbehaving.
@@ -186,7 +187,8 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `revListCount(options?)` | Just the count of `revList(options)`. Pair with `range` for "how many commits is FETCH_HEAD ahead of HEAD?" in one call |
 | `isAncestor(maybeAncestor, descendant)` | `true` iff `maybeAncestor` is reachable from `descendant` (reflexive). Mirrors `git merge-base --is-ancestor` |
 | `readFileAtRef(filepath, ref?, options?)` | `{encoding: 'utf8' \| 'buffer'}` |
-| `listTrackedFiles(ref?)` | `git ls-tree -r` |
+| `listTrackedFiles(ref?)` | `git ls-tree -r` — returns just the paths at `ref` |
+| `lsTree(options?)` | `{treeish, recursive, nameOnly, showTrees, pathspecs}`. Reads commit/tree **objects** (never the index), so it's immune to a stale `.git/index`. Returns `LsTreeEntry[]` (`{mode, type, oid, path}`) in native-git order. Throws on unborn HEAD / bad ref. Backs `git ls-tree` |
 | `getChangedFiles(fromRef, toRef?, options?)` | Diff two refs. `{filter}` |
 | `reset(ref?, options?)` | `{mode: 'soft' \| 'mixed' \| 'hard', paths}` |
 | `resetFile(filepath)` | Resets single file to HEAD |
@@ -279,8 +281,8 @@ for await (const line of mg.execStream('git log --oneline')) {
 }
 ```
 
-`log`, `ls-files`, and `rev-list` yield item-by-item; other subcommands compute
-the full output then yield line-by-line.
+`log`, `ls-files`, `ls-tree`, and `rev-list` yield item-by-item; other
+subcommands compute the full output then yield line-by-line.
 
 ### Cancellation
 

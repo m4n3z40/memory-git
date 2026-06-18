@@ -285,6 +285,8 @@ import type {
     CommitOptions,
     RemoveOptions,
     LsFilesOptions,
+    LsTreeOptions,
+    LsTreeEntry,
     DeleteBranchOptions,
     CheckoutOptions,
     MergeOptions,
@@ -334,6 +336,8 @@ export type {
     CommitOptions,
     RemoveOptions,
     LsFilesOptions,
+    LsTreeOptions,
+    LsTreeEntry,
     DeleteBranchOptions,
     CheckoutOptions,
     MergeOptions,
@@ -383,6 +387,23 @@ function matchesPathspec(file: string, spec: string): boolean {
     if (s === '' || s === '.') return true;
     if (file === s) return true;
     return file.startsWith(s + '/');
+}
+
+/**
+ * Orders tree entries the way git stores them inside a tree object: plain byte
+ * comparison of the name, except directory names sort as if they carried a
+ * trailing `/`. This is the order `git ls-tree` emits, and recursing in this
+ * order yields full paths in plain lexicographic order. isomorphic-git's
+ * `readTree` returns entries in readdir (plain-name) order instead, so callers
+ * that need git's order must re-sort with this.
+ */
+function compareTreeEntryPath(
+    a: { path: string; type: string },
+    b: { path: string; type: string },
+): number {
+    const an = a.type === 'tree' ? a.path + '/' : a.path;
+    const bn = b.type === 'tree' ? b.path + '/' : b.path;
+    return an < bn ? -1 : an > bn ? 1 : 0;
 }
 
 /**
@@ -2998,6 +3019,84 @@ export class MemoryGit {
         } catch (error) {
             this._logOperation('lsFiles', { options }, null, error as Error);
             throw error;
+        }
+    }
+
+    /**
+     * Lists the entries of a tree-ish straight from the object store — the
+     * in-repo equivalent of `git ls-tree`. Unlike {@link lsFiles} (which reads
+     * the **index**), this reads commit/tree objects, so it is **immune to a
+     * stale `.git/index`**: after a cold read of a rehydrated repo whose index
+     * lags behind durably-committed history, `lsTree('HEAD')` still reports
+     * every committed path. That is the whole reason this exists.
+     *
+     * `treeish` may be `HEAD`, a branch/tag name, a commit SHA, or a tree SHA;
+     * commits and annotated tags are peeled to their tree automatically.
+     *
+     * Output order matches native git: entries come in tree-object order
+     * (directories sort as if they end in `/`), and with `recursive` the full
+     * paths come out in plain lexicographic order — byte-for-byte the order of
+     * `git ls-tree -r`.
+     *
+     * Throws when `treeish` cannot be resolved — including an **unborn HEAD**
+     * (repo with no commits) — so callers can treat a throw as "fall back to
+     * the index" rather than mistaking an empty tree for "no tracked files".
+     */
+    async lsTree(options: LsTreeOptions = {}): Promise<LsTreeEntry[]> {
+        const treeish = options.treeish ?? 'HEAD';
+        try {
+            // Resolve to an OID up front. For an unborn HEAD or a bogus ref this
+            // throws (the caller's signal to fall back to the index), which is
+            // exactly the contract we want — never a silent empty list.
+            const oid = await this._resolveAny(treeish);
+
+            const recursive = !!options.recursive;
+            const showTrees = !!options.showTrees;
+            const out: LsTreeEntry[] = [];
+            // `_resolveAny` may hand back a commit/tag OID; `_readTreeEntries`
+            // (via readTree) peels it to the underlying tree for us.
+            await this._lsTreeCollect(oid, '', recursive, showTrees, out);
+
+            let entries = out;
+            const pathspecs = options.pathspecs ?? [];
+            if (pathspecs.length > 0) {
+                entries = entries.filter(e =>
+                    pathspecs.some(ps => matchesPathspec(e.path, ps)));
+            }
+
+            this._logOperation('lsTree', { options }, { success: true, count: entries.length });
+            return entries;
+        } catch (error) {
+            this._logOperation('lsTree', { options }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
+     * Depth-first tree walk for {@link lsTree}, emitting into `out` in native
+     * git order. Re-sorts each level with {@link compareTreeEntryPath} because
+     * isomorphic-git's `readTree` returns readdir order, not tree order.
+     * @private
+     */
+    private async _lsTreeCollect(
+        treeOid: string,
+        prefix: string,
+        recursive: boolean,
+        showTrees: boolean,
+        out: LsTreeEntry[],
+    ): Promise<void> {
+        const entries = await this._readTreeEntries(treeOid);
+        entries.sort(compareTreeEntryPath);
+        for (const e of entries) {
+            const fullPath = prefix ? `${prefix}/${e.path}` : e.path;
+            if (e.type === 'tree' && recursive) {
+                // -r descends into subtrees; the tree entry itself is emitted
+                // only under -t (showTrees), matching `git ls-tree -r [-t]`.
+                if (showTrees) out.push({ mode: e.mode, type: 'tree', oid: e.oid, path: fullPath });
+                await this._lsTreeCollect(e.oid, fullPath, recursive, showTrees, out);
+            } else {
+                out.push({ mode: e.mode, type: e.type, oid: e.oid, path: fullPath });
+            }
         }
     }
 

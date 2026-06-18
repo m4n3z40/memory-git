@@ -285,6 +285,42 @@ export interface LsFilesOptions {
     excludeStandard?: boolean;
 }
 
+export interface LsTreeOptions {
+    /**
+     * Tree-ish to read: `HEAD`, a branch/tag name, a commit SHA, or a tree SHA.
+     * Commits and annotated tags are peeled to their tree automatically.
+     * Default: `HEAD`.
+     */
+    treeish?: string;
+    /** Recurse into subtrees, listing entries at any depth (git ls-tree -r). */
+    recursive?: boolean;
+    /** Emit only the path of each entry (git ls-tree --name-only). */
+    nameOnly?: boolean;
+    /**
+     * With `recursive`, also emit the tree (directory) entries themselves, not
+     * just the blobs under them (git ls-tree -r -t). Without `recursive` this
+     * has no effect — the top level always lists its tree entries.
+     */
+    showTrees?: boolean;
+    /**
+     * Limit output to entries matching these pathspecs. A pathspec matches by
+     * exact path or as a leading directory (e.g. `src` matches `src/x.ts`).
+     * Empty/`.` matches everything. Glob/wildcard pathspecs are not supported.
+     */
+    pathspecs?: string[];
+}
+
+export interface LsTreeEntry {
+    /** 6-digit octal mode: `100644`, `100755`, `120000`, `040000`, `160000`. */
+    mode: string;
+    /** Object type of the entry. */
+    type: 'blob' | 'tree' | 'commit';
+    /** SHA-1 of the blob/tree/commit the entry points at. */
+    oid: string;
+    /** Full path relative to the repo root, `/`-separated. */
+    path: string;
+}
+
 export interface DeleteBranchOptions {
     /** Force delete even if not merged (git branch -D) */
     force?: boolean;
