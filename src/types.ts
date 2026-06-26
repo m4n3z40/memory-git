@@ -604,6 +604,29 @@ export interface TagsPointingAtOptions {
     skipPeel?: boolean;
 }
 
+export interface ForEachRefOptions {
+    /**
+     * Ref patterns to filter by (git's <pattern>... args). A glob-free pattern
+     * matches at-or-below its path (`refs/tags` ⇒ all tags); globs use
+     * pathname-aware matching. Empty/omitted ⇒ all refs (heads + tags + remotes).
+     */
+    patterns?: string[];
+    /**
+     * Sort keys in precedence order; leading `-` = descending. Supported:
+     * `refname` (default), `v:refname` / `version:refname`. Unsupported keys
+     * throw (they'd force resolving every ref before sorting).
+     */
+    sort?: string[];
+    /** Emit at most this many refs after sorting. <=0 / omitted ⇒ all. */
+    count?: number;
+    /**
+     * Format string with %(...) atoms. Defaults to git's
+     * `%(objectname) %(objecttype)\t%(refname)`. Only the atoms present are
+     * resolved per surviving ref — a refname-only format reads zero objects.
+     */
+    format?: string;
+}
+
 export interface ChangedFile {
     filepath: string;
     status: 'added' | 'modified' | 'deleted' | 'renamed';

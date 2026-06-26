@@ -92,6 +92,7 @@ await mg.exec('git config user.name "Agent"');
 | `merge` | `<branch>`, `--no-ff`, `--ff-only`, `-m <msg>`, `--abort`, `-X/--strategy-option=ours\|theirs`, `--allow-unrelated-histories`, `--no-edit` |
 | `tag` | `<name>`, `-a -m <msg>`, `-d <name>`, `-f`, `-l`, `--points-at <ref>` |
 | `show-ref` | `[--heads] [--tags] [-d/--dereference]`. No flags = heads + tags + remotes (matches git default). `-d` adds the peeled `^{}` line for annotated tags |
+| `for-each-ref` | `[--count=<n>] [--sort=<key>]... [--format=<fmt>] [<pattern>...]`. Lists refs sorted, capped by `--count`, rendered through `--format` (`%(refname[:short\|:strip=n])`, `%(objectname[:short[=n]])`, `%(objecttype)`, deref `%(*objectname)`/`%(*objecttype)`, `%%`). Sort keys: `refname` (default), `v:refname`/`version:refname` (git versioncmp). **Lazy**: names are sorted as strings and only the survivors after `--count` resolve oids/objects — `--sort=-v:refname --count=1 refs/tags/'v*'` reads exactly one ref regardless of tag count |
 | `describe` | `[--exact-match] [--tags] [--abbrev=<n>] [<ref>]`. Default emits `<tag>-<N>-g<short>` (or just `<tag>` when ref is the tagged commit). `--exact-match` only matches annotated tags by default (matches git); `--tags` opts in to lightweight too |
 | `pack-refs` | `--all` (default behavior), `--prune` (always on) |
 | `reset` | `--soft`, `--mixed`, `--hard`, `<ref>`, `-- <files...>` |
@@ -180,6 +181,7 @@ The class-based API is fully typed and remains the preferred entry point when yo
 | `log(options?)` | `{depth, ref, author, since, until}`. Returns `CommitInfo[]` (now also carries `parents`, `tree`, `committer`, and tz offsets so log/show can emit byte-identical git-style dates and `Merge:` lines) |
 | `logText(options?)` | `{oneline, format}`. `format` expands `git log --format=<fmt>` placeholders (`%H`/`%h`/`%s`/`%an`/`%ae`/`%ad`/`%ai`/`%at`/`%cn`/`%ce`/`%cd`/`%ct`/`%T`/`%t`/`%P`/`%p`/`%b`/`%B`/`%n`/`%%`) one line per commit |
 | `showRefs(options?)` | `{heads, tags, remotes}` (any unset ⇒ all). Returns `{oid, ref, peeled?}` per ref. Backs `git show-ref` |
+| `forEachRef(options?)` | `{patterns, sort, count, format}`. Returns one formatted line per selected ref. Backs `git for-each-ref`. Sorts ref *names* (strings) and resolves oids/objects only for the survivors after `count` — `{sort:['-v:refname'], count:1, patterns:['refs/tags/v*']}` reads exactly one ref on a repo with thousands of tags |
 | `describe(ref?, options?)` | `{tags, abbrev}`. Walks parents from `ref` to the nearest tag, emits `<tag>-<N>-g<short>`. `N` is computed via `revListCount(tag..ref)` for merge-DAG accuracy. `--tags` includes lightweight tags |
 | `show(ref?)` | Commit metadata + changed files |
 | `resolveRef(ref?, options?)` | `git rev-parse`. `{short, abbrevRef}`. Accepts short OIDs |

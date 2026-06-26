@@ -26,6 +26,16 @@ import { LazyState, wrapLazyFs } from './lazy-fs.js';
 import { wrapRecordingFs, type MutationKind } from './recording-fs.js';
 import { getCommand, type Command } from './commands/index.js';
 import { primeSafeCompression } from './compression-fix.js';
+import {
+    DEFAULT_FORMAT,
+    formatNeeds,
+    interpolate,
+    makeRefComparator,
+    matchRef,
+    namespaceWanted,
+    parseSortKeys,
+    type ResolvedRef,
+} from './for-each-ref.js';
 
 // git's canonical empty-tree object id (`git hash-object -t tree /dev/null`).
 const EMPTY_TREE_OID = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
@@ -309,6 +319,7 @@ import type {
     ListTagsOptions,
     ShowTagRefsOptions,
     TagsPointingAtOptions,
+    ForEachRefOptions,
     ChangedFile,
     RevListOptions,
     ExecOptions,
@@ -360,6 +371,7 @@ export type {
     ListTagsOptions,
     ShowTagRefsOptions,
     TagsPointingAtOptions,
+    ForEachRefOptions,
     ChangedFile,
     RevListOptions,
     ExecOptions,
@@ -2815,6 +2827,88 @@ export class MemoryGit {
     }
 
     /**
+     * `git for-each-ref` — list refs, sorted, optionally capped by `--count`,
+     * each rendered through a `--format` string. Returns one formatted line
+     * per selected ref (the bash command joins them).
+     *
+     * LAZINESS IS THE POINT. Candidate gathering and sorting touch ref *names*
+     * only (strings) — no oids, no objects. We sort, slice to `count`, and ONLY
+     * THEN resolve oids/objects, and only the atoms the format actually uses.
+     * So `--sort=-v:refname --count=1 --format=%(refname:short) refs/tags/v*`
+     * sorts 2000 names but reads zero objects and resolves zero refs; the
+     * default format on the same query resolves exactly the one winner.
+     *
+     * Supported sort keys: refname (default), v:refname / version:refname.
+     * Object-valued sort keys would defeat the laziness and are rejected.
+     */
+    async forEachRef(opts: ForEachRefOptions = {}): Promise<string[]> {
+        try {
+            const patterns = opts.patterns ?? [];
+            const format = opts.format ?? DEFAULT_FORMAT;
+
+            // 1. Gather candidate ref NAMES (strings only). Skip whole
+            //    namespaces no pattern can reach (refs/tags/v* → tags only).
+            const names: string[] = [];
+            if (namespaceWanted(patterns, 'refs/heads/')) {
+                for (const b of await git.listBranches({ fs: this.fs, dir: this.dir })) {
+                    names.push(`refs/heads/${b}`);
+                }
+            }
+            if (namespaceWanted(patterns, 'refs/tags/')) {
+                for (const t of await git.listTags({ fs: this.fs, dir: this.dir })) {
+                    names.push(`refs/tags/${t}`);
+                }
+            }
+            if (namespaceWanted(patterns, 'refs/remotes/')) {
+                for (const r of await this.listRemotes()) {
+                    let remoteBranches: string[] = [];
+                    try {
+                        remoteBranches = await git.listBranches({ fs: this.fs, dir: this.dir, remote: r.remote });
+                    } catch {
+                        continue;
+                    }
+                    for (const b of remoteBranches) {
+                        if (b === 'HEAD') continue; // symbolic, omitted like show-ref
+                        names.push(`refs/remotes/${r.remote}/${b}`);
+                    }
+                }
+            }
+
+            // 2. Filter by pattern, sort by name/version, cap to --count.
+            const filtered = names.filter(n => matchRef(patterns, n));
+            filtered.sort(makeRefComparator(parseSortKeys(opts.sort)));
+            const count = opts.count != null && opts.count > 0 ? opts.count : filtered.length;
+            const selected = filtered.slice(0, count);
+
+            // 3. Resolve ONLY the survivors, and only the fields the format
+            //    needs. A refname-only format reads nothing.
+            const needs = formatNeeds(format);
+            const lines = await Promise.all(selected.map(async refname => {
+                const r: ResolvedRef = { refname };
+                if (needs.oid) {
+                    r.oid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: refname });
+                    if (needs.type || needs.deref) {
+                        const { type } = await git.readObject({ fs: this.fs, dir: this.dir, oid: r.oid, format: 'content' });
+                        r.type = type;
+                        if (needs.deref && type === 'tag') {
+                            const { tag } = await git.readTag({ fs: this.fs, dir: this.dir, oid: r.oid });
+                            r.derefOid = tag.object;
+                            r.derefType = tag.type;
+                        }
+                    }
+                }
+                return interpolate(format, r);
+            }));
+
+            this._logOperation('forEachRef', { ...opts }, { success: true, count: lines.length, total: filtered.length });
+            return lines;
+        } catch (error) {
+            this._logOperation('forEachRef', { ...opts }, null, error as Error);
+            throw error;
+        }
+    }
+
+    /**
      * Lists tag references resolving annotated tags to their target commit OID
      * (equivalent to `git show-ref --tags -d`), with optional pagination and
      * parallelism.
@@ -4783,7 +4877,16 @@ export class MemoryGit {
      * @private
      */
     private _dispatch(cmd: string): { handler: Command | undefined; args: string[] } {
-        const tokens = shellParse(cmd).filter((t): t is string => typeof t === 'string');
+        // shell-quote treats unquoted `(`/`)` as subshell operators and drops
+        // them, which would shred `for-each-ref --format=%(refname)` into
+        // `--format=%`. We emulate the git CLI, not a real shell — parens in
+        // args are always literal — so escape them to literal before parsing.
+        // Unquoted globs (`refs/tags/v*`) come back as `{op:'glob', pattern}`;
+        // there's no shell to expand them here, so pass the pattern through
+        // verbatim (git would receive it literally under nullglob/no-match).
+        const tokens = shellParse(cmd.replace(/([()])/g, '\\$1'))
+            .map(t => (typeof t === 'string' ? t : (t as { op?: string; pattern?: string }).pattern))
+            .filter((t): t is string => typeof t === 'string');
         if (tokens.length === 0) return { handler: undefined, args: [] };
         if (tokens[0] === 'git') tokens.shift();
         if (tokens.length === 0) return { handler: undefined, args: [] };
