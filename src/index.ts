@@ -402,6 +402,43 @@ function matchesPathspec(file: string, spec: string): boolean {
 }
 
 /**
+ * Backslash-escape `(`/`)` that are OUTSIDE quotes, leaving quoted regions
+ * untouched. shell-quote treats unquoted parens as subshell operators and
+ * drops them (shredding `--format=%(refname)` into `--format=%`); escaping
+ * them makes shell-quote pass them through as literals. We must NOT escape
+ * parens that are already inside quotes — a backslash there is literal, so
+ * blanket-escaping turned `--format='%(refname)'` into `%\(refname\)`. Quoting
+ * an arg is therefore a no-op, matching how a real shell hands literal parens
+ * to git. Backslash escapes (unquoted and inside double quotes) are honored so
+ * we track quote boundaries correctly.
+ */
+function escapeUnquotedParens(cmd: string): string {
+    let out = '';
+    let quote: "'" | '"' | null = null;
+    for (let i = 0; i < cmd.length; i++) {
+        const c = cmd[i];
+        if (quote === "'") {
+            out += c;
+            if (c === "'") quote = null;
+        } else if (quote === '"') {
+            out += c;
+            if (c === '\\' && i + 1 < cmd.length) out += cmd[++i];
+            else if (c === '"') quote = null;
+        } else if (c === '\\' && i + 1 < cmd.length) {
+            out += c + cmd[++i];
+        } else if (c === "'" || c === '"') {
+            quote = c;
+            out += c;
+        } else if (c === '(' || c === ')') {
+            out += '\\' + c;
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+/**
  * Orders tree entries the way git stores them inside a tree object: plain byte
  * comparison of the name, except directory names sort as if they carried a
  * trailing `/`. This is the order `git ls-tree` emits, and recursing in this
@@ -4877,14 +4914,16 @@ export class MemoryGit {
      * @private
      */
     private _dispatch(cmd: string): { handler: Command | undefined; args: string[] } {
-        // shell-quote treats unquoted `(`/`)` as subshell operators and drops
+        // shell-quote treats UNQUOTED `(`/`)` as subshell operators and drops
         // them, which would shred `for-each-ref --format=%(refname)` into
         // `--format=%`. We emulate the git CLI, not a real shell — parens in
-        // args are always literal — so escape them to literal before parsing.
-        // Unquoted globs (`refs/tags/v*`) come back as `{op:'glob', pattern}`;
-        // there's no shell to expand them here, so pass the pattern through
-        // verbatim (git would receive it literally under nullglob/no-match).
-        const tokens = shellParse(cmd.replace(/([()])/g, '\\$1'))
+        // args are always literal — so escape the unquoted ones before parsing
+        // (escaping quoted ones would leave the backslash in, breaking
+        // `--format='%(refname)'`). Unquoted globs (`refs/tags/v*`) come back
+        // as `{op:'glob', pattern}`; there's no shell to expand them here, so
+        // pass the pattern through verbatim (git gets it literally under
+        // nullglob/no-match).
+        const tokens = shellParse(escapeUnquotedParens(cmd))
             .map(t => (typeof t === 'string' ? t : (t as { op?: string; pattern?: string }).pattern))
             .filter((t): t is string => typeof t === 'string');
         if (tokens.length === 0) return { handler: undefined, args: [] };

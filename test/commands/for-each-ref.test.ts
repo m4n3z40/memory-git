@@ -142,6 +142,32 @@ describe('exec("for-each-ref")', () => {
         const n = await mg.exec('for-each-ref --format=%(objectname:short=12) refs/heads/main');
         expect(n).toBe(headOid.slice(0, 12));
     });
+
+    // Regression: a single-quoted --format value (what any shell-quoting caller
+    // emits, since the value contains `()`) must interpolate identically to the
+    // unquoted form. The tokenizer used to backslash-escape the parens inside
+    // the quotes, so the atom never matched and was echoed verbatim.
+    describe('quoting the --format value is a no-op', () => {
+        const base = "for-each-ref --sort=-v:refname --count=1";
+        const tail = "refs/tags/'v*'";
+        for (const atom of ['%(refname)', '%(refname:short)', '%(objectname)', '%(objectname:short)', '%(objecttype)']) {
+            it(`single-quoted '${atom}' === unquoted ${atom}`, async () => {
+                const unquoted = await mg.exec(`${base} --format=${atom} ${tail}`);
+                const quoted = await mg.exec(`${base} --format='${atom}' ${tail}`);
+                expect(quoted).toBe(unquoted);
+                // And no leftover backslashes/parens leaked through.
+                expect(quoted).not.toContain('\\');
+            });
+        }
+
+        it('a mixed literal+atom format interpolates when single-quoted', async () => {
+            // The literal space means this MUST be quoted to stay one arg
+            // (unquoted, the shell splits it) — so quoting is required here,
+            // not a no-op. Assert it interpolates to the golden line.
+            const quoted = await mg.exec(`${base} --format='%(objectname:short) %(refname:short)' ${tail}`);
+            expect(quoted).toBe(`${headOid.slice(0, 7)} v0.0.${N}`);
+        });
+    });
 });
 
 /**
