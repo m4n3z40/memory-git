@@ -865,10 +865,13 @@ export class MemoryGit {
         originalRef: string,
     ): Promise<string> {
         let cur = oid;
+        // Per-walk iso-git cache — `HEAD~50` is 50 readCommits over the
+        // same pack; parse it once (same convention as _walkTopoDate).
+        const cache: Record<string, unknown> = {};
         for (const op of ops) {
             if (op.type === '~') {
                 for (let k = 0; k < op.n; k++) {
-                    const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur });
+                    const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur, cache });
                     if (!commit.parent || commit.parent.length === 0) {
                         throw new Error(`fatal: ambiguous argument '${originalRef}': unknown revision (walked past root)`);
                     }
@@ -876,7 +879,7 @@ export class MemoryGit {
                 }
             } else {
                 if (op.n === 0) continue;
-                const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur });
+                const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur, cache });
                 if (!commit.parent || op.n > commit.parent.length) {
                     throw new Error(`fatal: ambiguous argument '${originalRef}': commit has no parent ${op.n}`);
                 }
@@ -2263,6 +2266,10 @@ export class MemoryGit {
             // second readTag pass.
             const looseRefs: { name: string; oid: string; peeled?: string }[] = [];
             const CONCURRENCY = 64;
+            // Shared per-op iso-git cache for the annotated-tag peels below —
+            // same rationale as _doLoadAllTagOids: one pack parse per
+            // packRefs() call instead of one per tag.
+            const cache: Record<string, unknown> = {};
 
             for (const root of refRoots) {
                 let names: string[] = [];
@@ -2282,7 +2289,7 @@ export class MemoryGit {
                             let peeled: string | undefined;
                             if (root === 'refs/tags') {
                                 try {
-                                    const obj = await git.readTag({ fs: this.fs, dir: this.dir, oid });
+                                    const obj = await git.readTag({ fs: this.fs, dir: this.dir, oid, cache });
                                     peeled = obj.tag.object;
                                 } catch {
                                     // Lightweight — no peel line.
@@ -2452,11 +2459,14 @@ export class MemoryGit {
      * tags whose peeled OID isn't available via the packed-refs fast
      * path. Avoid calling this in a hot loop — see `_loadAllTagOids`.
      */
-    private async _resolveTagToCommit(tagName: string): Promise<TagRef> {
+    private async _resolveTagToCommit(
+        tagName: string,
+        cache: Record<string, unknown> = {},
+    ): Promise<TagRef> {
         const refOid = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: `refs/tags/${tagName}` });
         let commitOid = refOid;
         try {
-            const obj = await git.readTag({ fs: this.fs, dir: this.dir, oid: refOid });
+            const obj = await git.readTag({ fs: this.fs, dir: this.dir, oid: refOid, cache });
             commitOid = obj.tag.object;
         } catch {
             // Lightweight tag — refOid is already the commit
@@ -2659,6 +2669,18 @@ export class MemoryGit {
         if (looseNames.length > 0) {
             const CONCURRENCY = 64;
             const skipPeel = !!opts.skipPeel;
+            // Shared per-load iso-git cache. Each `readTag` below otherwise
+            // opens and indexes the repo's packfiles from scratch — even for
+            // LIGHTWEIGHT tags, where readTag does the full object read
+            // before throwing. On a repo with hundreds of loose tags and a
+            // multi-hundred-MB pack, 64 concurrent uncached reads multiply
+            // into tens of GiB of transient allocations (prod OOM,
+            // 2026-07-13: 380 tags × 718MiB pack ≈ 45GiB / 7min for one
+            // `git tag --points-at HEAD`). With the cache the pack is
+            // parsed once per load. Scoped to this call — parsed objects
+            // are dropped when the load settles (see _walkTopoDate for the
+            // same convention).
+            const cache: Record<string, unknown> = {};
             for (let i = 0; i < looseNames.length; i += CONCURRENCY) {
                 const chunk = looseNames.slice(i, i + CONCURRENCY);
                 await Promise.all(chunk.map(async (tagName) => {
@@ -2676,7 +2698,7 @@ export class MemoryGit {
                         let peeledOid: string | undefined;
                         if (!skipPeel) {
                             try {
-                                const obj = await git.readTag({ fs: this.fs, dir: this.dir, oid: refOid });
+                                const obj = await git.readTag({ fs: this.fs, dir: this.dir, oid: refOid, cache });
                                 peeledOid = obj.tag.object;
                             } catch {
                                 // Lightweight tag — refOid is already the commit, no peel needed.
@@ -2786,6 +2808,9 @@ export class MemoryGit {
         const seen = new Set<string>([oid]);
         const queue: string[] = [oid];
         let extras = 0;
+        // Per-walk iso-git cache — one pack parse for the whole ancestor
+        // walk instead of one per commit (same convention as _walkTopoDate).
+        const cache: Record<string, unknown> = {};
         while (queue.length > 0) {
             const cur = queue.shift()!;
             const tag = commitToTag.get(cur);
@@ -2796,7 +2821,7 @@ export class MemoryGit {
                 return `${tag}-${n}-g${oid.slice(0, abbrev)}`;
             }
             try {
-                const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur });
+                const { commit } = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur, cache });
                 extras += Math.max(0, commit.parent.length - 1);
                 for (const p of commit.parent) {
                     if (!seen.has(p)) {
@@ -3049,10 +3074,16 @@ export class MemoryGit {
                 const names = await this.listTags({ limit: opts.limit, reverse: opts.reverse });
                 const result: TagRef[] = [];
                 const CONCURRENCY = 64;
+                // Shared per-op iso-git cache: without it every annotated-tag
+                // peel re-opens and re-indexes the packfile from scratch —
+                // N tags × a multi-hundred-MB pack is a memory storm, not a
+                // read (see _doLoadAllTagOids). Scoped to this call so parsed
+                // objects don't outlive the operation.
+                const cache: Record<string, unknown> = {};
                 for (let i = 0; i < names.length; i += CONCURRENCY) {
                     const chunk = names.slice(i, i + CONCURRENCY);
                     const resolved = await Promise.all(chunk.map(async (tagName) => {
-                        const ref = await this._resolveTagToCommit(tagName);
+                        const ref = await this._resolveTagToCommit(tagName, cache);
                         return ref;
                     }));
                     result.push(...resolved);
@@ -3795,6 +3826,9 @@ export class MemoryGit {
         const reachable = new Set<string>();
         const gitdir = pathNode.posix.join(this.dir, '.git');
         const args = { fs: this.fs, dir: this.dir };
+        // Per-op iso-git cache — this walk touches every commit, tree, and
+        // tag in the repo; without it each read re-parses the packfiles.
+        const cache: Record<string, unknown> = {};
 
         const tipOids = new Set<string>();
         const addTip = async (ref: string) => {
@@ -3823,18 +3857,18 @@ export class MemoryGit {
         // both ends must end up in the reachable set.
         const commitFrontier: string[] = [];
         for (const oid of tipOids) {
-            const { type } = await git.readObject({ fs: this.fs, gitdir, oid, format: 'parsed' });
+            const { type } = await git.readObject({ fs: this.fs, gitdir, oid, format: 'parsed', cache });
             reachable.add(oid);
             if (type === 'tag') {
-                const { tag } = await git.readTag({ fs: this.fs, gitdir, oid });
+                const { tag } = await git.readTag({ fs: this.fs, gitdir, oid, cache });
                 reachable.add(tag.object);
                 if (tag.type === 'commit') commitFrontier.push(tag.object);
-                else if (tag.type === 'tree') await this._walkTree(gitdir, tag.object, reachable);
+                else if (tag.type === 'tree') await this._walkTree(gitdir, tag.object, reachable, cache);
                 // blob tag target needs no further walking.
             } else if (type === 'commit') {
                 commitFrontier.push(oid);
             } else if (type === 'tree') {
-                await this._walkTree(gitdir, oid, reachable);
+                await this._walkTree(gitdir, oid, reachable, cache);
             }
         }
 
@@ -3847,8 +3881,8 @@ export class MemoryGit {
             if (visitedCommits.has(oid)) continue;
             visitedCommits.add(oid);
             reachable.add(oid);
-            const { commit } = await git.readCommit({ fs: this.fs, gitdir, oid });
-            await this._walkTree(gitdir, commit.tree, reachable);
+            const { commit } = await git.readCommit({ fs: this.fs, gitdir, oid, cache });
+            await this._walkTree(gitdir, commit.tree, reachable, cache);
             for (const parent of commit.parent || []) queue.push(parent);
         }
 
@@ -3860,13 +3894,18 @@ export class MemoryGit {
      * `acc`. Submodule entries (type === 'commit') are added as bare OIDs
      * but not followed (the submodule's history lives in another repo).
      */
-    private async _walkTree(gitdir: string, treeOid: string, acc: Set<string>): Promise<void> {
+    private async _walkTree(
+        gitdir: string,
+        treeOid: string,
+        acc: Set<string>,
+        cache: Record<string, unknown> = {},
+    ): Promise<void> {
         if (acc.has(treeOid)) return;
         acc.add(treeOid);
-        const { tree } = await git.readTree({ fs: this.fs, gitdir, oid: treeOid });
+        const { tree } = await git.readTree({ fs: this.fs, gitdir, oid: treeOid, cache });
         for (const entry of tree) {
             if (entry.type === 'tree') {
-                await this._walkTree(gitdir, entry.oid, acc);
+                await this._walkTree(gitdir, entry.oid, acc, cache);
             } else if (entry.type === 'blob') {
                 acc.add(entry.oid);
             }
